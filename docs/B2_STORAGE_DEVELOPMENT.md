@@ -2,6 +2,8 @@
 
 Status: development-only groundwork for Backblaze B2 via its S3-compatible API. This branch does **not** yet store Immich uploads in B2 and is not ready for a personal-media import.
 
+The isolated [durable staging and object catalog](OBJECT_CATALOG_DEVELOPMENT.md) now adds owned staging, durable intents, exact-version verification and conservative cleanup/recovery. It is not wired into the application; the provider contract below remains unchanged.
+
 ## What exists
 
 - `server/src/repositories/object-store.repository.ts`: explicit object identities, readable GETs, file-only PUTs and deletes, with strict inclusive byte ranges. Shared file-opening and byte-validation helpers live alongside this unwired contract rather than in a new dependency layer.
@@ -27,8 +29,8 @@ Source/transform errors abort a provider-owned controller, combined with the cal
 
 ## Not implemented
 
-- Upload/download route integration, storage metadata migrations and application dependency injection.
-- Independent integrity verification and durable upload/deletion operation state.
+- Application upload/download integration, asset-to-object mappings and application dependency injection.
+- Application-facing integrity/recovery jobs; the isolated catalog now implements verification and durable state.
 - Multipart uploads, resumable uploads and retry-safe replay of consumed streams.
 - Materialization leases/cache policy for native media tools and generated-media upload.
 - A complete backup/restore/export path or verified B2 endpoint configuration.

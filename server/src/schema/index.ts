@@ -63,6 +63,8 @@ import { MemoryTable } from 'src/schema/tables/memory.table.js';
 import { MoveTable } from 'src/schema/tables/move.table.js';
 import { NaturalEarthCountriesTable } from 'src/schema/tables/natural-earth-countries.table.js';
 import { NotificationTable } from 'src/schema/tables/notification.table.js';
+import { ObjectUploadIntentTable } from 'src/schema/tables/object-upload-intent.table.js';
+import { ObjectVersionTable } from 'src/schema/tables/object-version.table.js';
 import { OcrSearchTable } from 'src/schema/tables/ocr-search.table.js';
 import { PartnerAuditTable } from 'src/schema/tables/partner-audit.table.js';
 import { PartnerTable } from 'src/schema/tables/partner.table.js';
@@ -79,6 +81,7 @@ import { SharedLinkTable } from 'src/schema/tables/shared-link.table.js';
 import { SmartSearchTable } from 'src/schema/tables/smart-search.table.js';
 import { StackAuditTable } from 'src/schema/tables/stack-audit.table.js';
 import { StackTable } from 'src/schema/tables/stack.table.js';
+import { StagedObjectTable } from 'src/schema/tables/staged-object.table.js';
 import { SessionSyncCheckpointTable } from 'src/schema/tables/sync-checkpoint.table.js';
 import { SystemMetadataTable } from 'src/schema/tables/system-metadata.table.js';
 import { TagAssetTable } from 'src/schema/tables/tag-asset.table.js';
@@ -102,6 +105,9 @@ import { WorkflowTable } from 'src/schema/tables/workflow.table.js';
 @Database({ name: 'immich' })
 export class ImmichDatabase {
   tables = [
+    StagedObjectTable,
+    ObjectUploadIntentTable,
+    ObjectVersionTable,
     ActivityTable,
     AlbumAssetTable,
     AlbumAssetAuditTable,
@@ -208,6 +214,9 @@ export interface Migrations {
 }
 
 export interface DB {
+  staged_object: StagedObjectTable;
+  object_upload_intent: ObjectUploadIntentTable;
+  object_version: ObjectVersionTable;
   kysely_migrations: { timestamp: string; name: string };
 
   activity: ActivityTable;
