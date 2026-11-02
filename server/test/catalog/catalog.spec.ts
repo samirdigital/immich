@@ -10,6 +10,7 @@ import {
   link,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename,
@@ -74,6 +75,42 @@ beforeEach(async () => {
 afterEach(async () => {
   await chmod(root, 0o700);
   await rm(directory, { recursive: true, force: true });
+});
+
+it('persists a configured physical namespace with generated stage and intent suffixes', async () => {
+  const prefix = `immich-b2-qualification/${randomUUID()}`;
+  const configured = new ObjectCatalogRepository(db, { objectKeyPrefix: prefix });
+  const stage = await service.stage(source);
+  const intent = await configured.prepare(stage.id, 's3', 'synthetic-bucket');
+  expect(intent.key).toBe(`${prefix}/${stage.id}/${intent.id}`);
+  const stored = await repository.getIntent(intent.id);
+  expect(stored.key).toBe(intent.key);
+});
+
+it('retains constructor namespace in connection-bound cleanup repositories', async () => {
+  const prefix = `immich-b2-qualification/${randomUUID()}`;
+  const configured = new ObjectCatalogRepository(db, { objectKeyPrefix: prefix });
+  const stage = await service.stage(source);
+  const intent = await configured.withCleanupLock(stage.id, (bound) =>
+    bound.prepare(stage.id, 's3', 'synthetic-bucket'),
+  );
+  expect(intent.key).toBe(`${prefix}/${stage.id}/${intent.id}`);
+});
+
+it('uses the persisted stage UUID rather than a caller UUID spelling in the generated key', async () => {
+  const stage = await service.stage(source);
+  const intent = await repository.prepare(`{${stage.id.toUpperCase()}}`, 's3', 'synthetic-bucket');
+  expect(intent.key).toBe(`catalog/${stage.id}/${intent.id}`);
+});
+
+it.each(['catalog', 'a'.repeat(950), 'Team_1/archive.v2'])('accepts bounded normal namespace %s', async (prefix) => {
+  const config = { objectKeyPrefix: prefix };
+  const configured = new ObjectCatalogRepository(db, config);
+  config.objectKeyPrefix = 'changed-after-construction';
+  const stage = await service.stage(source);
+  const intent = await configured.prepare(stage.id, 's3', 'synthetic-bucket');
+  expect(intent.key).toBe(`${prefix}/${stage.id}/${intent.id}`);
+  expect(Buffer.byteLength(intent.key)).toBeLessThanOrEqual(1024);
 });
 
 it('durably stages an exclusive owned readonly copy with lossless identity and SHA256', async () => {
@@ -952,14 +989,18 @@ it('new migration alone can revert and reapply without extensions or the upstrea
   await upMultipart(db);
 });
 
-async function s3Loopback(stageId: string, partDelayMs = 0) {
+async function s3Loopback(stageId: string, partDelayMs = 0, options: { partSize?: number; expectedKey?: string } = {}) {
   const parts: Buffer[] = [];
   const requests: string[] = [];
   const failures: unknown[] = [];
   let completed = Buffer.alloc(0);
+  let deletedVersion = false;
   const server = createServer((request, response) => {
     void (async () => {
       const url = new URL(request.url!, 'http://localhost');
+      if (options.expectedKey) {
+        expect(decodeURIComponent(url.pathname)).toBe(`/synthetic-bucket/${options.expectedKey}`);
+      }
       requests.push(`${request.method} ${url.search}`);
       const [journal] = await repository.listMultipart(stageId);
       if (url.searchParams.has('uploads')) {
@@ -992,6 +1033,10 @@ async function s3Loopback(stageId: string, partDelayMs = 0) {
             break;
           }
           case 'DELETE': {
+            if (url.searchParams.has('versionId')) {
+              expect(url.searchParams.get('versionId')).toBe('loopback-exact-version');
+              deletedVersion = true;
+            }
             response.statusCode = 204;
             response.end();
 
@@ -999,6 +1044,12 @@ async function s3Loopback(stageId: string, partDelayMs = 0) {
           }
           case 'GET': {
             expect(url.searchParams.get('versionId')).toBe('loopback-exact-version');
+            if (deletedVersion) {
+              expect(request.headers.range).toBe('bytes=0-0');
+              response.statusCode = 404;
+              response.end('<Error><Code>NoSuchVersion</Code></Error>');
+              break;
+            }
             response.setHeader('x-amz-version-id', 'loopback-exact-version');
             response.setHeader('content-length', completed.length);
             response.end(completed);
@@ -1027,7 +1078,7 @@ async function s3Loopback(stageId: string, partDelayMs = 0) {
     requestChecksumCalculation: 'WHEN_REQUIRED',
     responseChecksumValidation: 'WHEN_REQUIRED',
   });
-  const partSize = 5 * 1024 ** 2;
+  const partSize = options.partSize ?? 5 * 1024 ** 2;
   const store = new S3ObjectStoreRepository(client, {
     bucket: 'synthetic-bucket',
     multipart: { threshold: partSize, partSize, maxObjectSize: partSize * 10, cleanupTimeoutMs: 1000 },
@@ -1036,6 +1087,7 @@ async function s3Loopback(stageId: string, partDelayMs = 0) {
     store,
     requests,
     failures,
+    parts,
     endpoint: `http://127.0.0.1:${address.port}`,
     close: async () => {
       client.destroy();
@@ -1159,6 +1211,62 @@ it('integrates actual SDK multipart checkpoints with durable catalog and indepen
     expect(await service.cleanup(stage.id)).toBe(true);
     expect(fixture.failures).toEqual([]);
     expect(fixture.requests).toHaveLength(5);
+  } finally {
+    await fixture.close();
+  }
+});
+
+it('carries one immutable configured key through real SDK multipart, journal, full GET, cleanup and exact deletion offline', async () => {
+  const file = await open(source, 'w');
+  try {
+    const chunk = Buffer.alloc(1024 ** 2, 29);
+    for (let index = 0; index < 17; index++) {
+      await file.writeFile(chunk);
+    }
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  const prefix = `immich-b2-qualification/${randomUUID()}`;
+  const configured = new ObjectCatalogRepository(db, { objectKeyPrefix: prefix });
+  const staging = new ObjectCatalogService(configured, root);
+  const stage = await staging.stage(source);
+  const prepared = await configured.prepare(stage.id, 's3', 'physical-loopback-1');
+  expect(prepared.key).toBe(`${prefix}/${stage.id}/${prepared.id}`);
+  // A restarted/default-config service sends the persisted key, never its current prefix.
+  const fixture = await s3Loopback(stage.id, 0, { partSize: 8 * 1024 ** 2, expectedKey: prepared.key });
+  try {
+    const binding = { provider: 's3' as const, storeId: 'physical-loopback-1', store: fixture.store };
+    const version = await service.sendPrepared(prepared.id, binding);
+    expect(version.key).toBe(prepared.key);
+    expect(version.versionId).toBe('loopback-exact-version');
+    expect(version.verification).toBe('pending');
+    expect(fixture.parts.map((part) => part.length)).toEqual([8 * 1024 ** 2, 8 * 1024 ** 2, 1024 ** 2]);
+    const [journal] = await configured.listMultipart(stage.id);
+    expect(journal.key).toBe(prepared.key);
+    expect(journal.state).toBe('received');
+    expect(journal.response?.versionId).toBe(version.versionId);
+    await configured.releaseStage(stage.id);
+    expect(await staging.cleanup(stage.id)).toBe(false);
+    expect(await staging.verify(stage.id, version.id, binding)).toBe(true);
+    const [verified] = await repository.listVersions(stage.id);
+    expect(verified.verification).toBe('verified');
+    expect(verified.observations[0].detail).toBe(`Full GET size=${stage.size} sha256=${stage.hash}`);
+    // SQL identity FKs prevent changing a key after version and journal acknowledgement.
+    await expect(
+      db.updateTable('object_upload_intent').set({ key: 'catalog/wrong' }).where('id', '=', prepared.id).execute(),
+    ).rejects.toThrow();
+    const unchanged = await repository.getIntent(prepared.id);
+    expect(unchanged.key).toBe(prepared.key);
+    expect(await staging.cleanup(stage.id)).toBe(true);
+    const cleaned = await repository.getStage(stage.id);
+    expect(cleaned?.state).toBe('deleted');
+    expect(await readdir(root)).toEqual([]);
+    const exact = { key: verified.key, versionId: verified.versionId! };
+    await fixture.store.delete(exact);
+    expect(await fixture.store.get(exact, { range: { start: 0, end: 0 } })).toBeUndefined();
+    expect(fixture.failures).toEqual([]);
+    expect(fixture.requests).toHaveLength(8);
   } finally {
     await fixture.close();
   }

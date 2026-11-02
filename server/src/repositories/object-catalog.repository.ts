@@ -17,7 +17,22 @@ export interface MultipartBinding {
 }
 
 export class ObjectCatalogRepository {
-  constructor(private db: Kysely<DB>) {}
+  private readonly objectKeyPrefix: string;
+
+  constructor(
+    private db: Kysely<DB>,
+    options: { readonly objectKeyPrefix?: string } = {},
+  ) {
+    const prefix = options.objectKeyPrefix === undefined ? 'catalog' : options.objectKeyPrefix;
+    if (
+      typeof prefix !== 'string' ||
+      Buffer.byteLength(prefix) > 950 ||
+      !/^[A-Za-z0-9_-][A-Za-z0-9._-]*(\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$/.test(prefix)
+    ) {
+      throw new Error('Invalid catalog object key prefix');
+    }
+    this.objectKeyPrefix = prefix;
+  }
 
   listMultipart(stageId: string) {
     return this.db
@@ -241,7 +256,7 @@ export class ObjectCatalogRepository {
       const key = sql`hashtextextended(${`object-catalog-cleanup:${id}`}::text, 0)`;
       try {
         await sql`SELECT pg_advisory_lock(${key})`.execute(db);
-        return await action(new ObjectCatalogRepository(db));
+        return await action(new ObjectCatalogRepository(db, { objectKeyPrefix: this.objectKeyPrefix }));
       } finally {
         await sql`SELECT pg_advisory_unlock(${key})`.execute(db);
       }
@@ -429,7 +444,14 @@ export class ObjectCatalogRepository {
       const id = randomUUID();
       return db
         .insertInto('object_upload_intent')
-        .values({ id, stageId, provider, storeId, key: `catalog/${stageId}/${id}`, state: 'prepared' })
+        .values({
+          id,
+          stageId: stage.id,
+          provider,
+          storeId,
+          key: `${this.objectKeyPrefix}/${stage.id}/${id}`,
+          state: 'prepared',
+        })
         .returningAll()
         .executeTakeFirstOrThrow();
     });
