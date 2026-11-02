@@ -185,6 +185,18 @@ describe(LocalObjectStoreRepository.name, () => {
     expect(await readdir(root)).toEqual([]);
   });
 
+  it('closes the owned descriptor on invalid sealed identity without creating a destination', async () => {
+    const bytes = Buffer.from('sealed');
+    const filename = await stage(bytes);
+    const file = await open(filename, 'r');
+    vitest.mocked(open).mockResolvedValueOnce(file);
+    await expect(
+      store.putFile(object, filename, { ...options(bytes), expectedFileIdentity: {} as never }),
+    ).rejects.toThrow('identity');
+    expect(file.fd).toBe(-1);
+    expect(await readdir(root)).toEqual([]);
+  });
+
   it('should close the source if destination setup throws synchronously', async () => {
     const bytes = Buffer.from('data');
     const filename = await stage(bytes);

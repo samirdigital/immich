@@ -214,6 +214,43 @@ export class ObjectCatalogService {
     if (!claim?.token) {
       throw new Error('Claim lost');
     }
+    const controller = new AbortController();
+    let stopped = false;
+    let renewal = Promise.resolve();
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      timer = setTimeout(
+        () => {
+          const deadline = setTimeout(
+            () => controller.abort(new Error('Upload renewal deadline exceeded')),
+            Math.max(1, Math.floor(leaseMs / 3)),
+          );
+          renewal = this.catalog
+            .renewSending(intent.id, claim.token!, leaseMs)
+            .then((valid) => {
+              if (!valid) {
+                throw new Error('Upload lease lost');
+              }
+            })
+            .catch(() => {
+              controller.abort(new Error('Upload lease lost or renewal failed'));
+            })
+            .finally(() => {
+              clearTimeout(deadline);
+              if (!stopped && !controller.signal.aborted) {
+                schedule();
+              }
+            });
+        },
+        Math.max(1, Math.min(10_000, Math.floor(leaseMs / 3))),
+      );
+    };
+    const stopRenewal = async () => {
+      stopped = true;
+      clearTimeout(timer);
+      await renewal;
+    };
+    schedule();
     let result: ObjectWriteResult | undefined;
     try {
       try {
@@ -222,18 +259,50 @@ export class ObjectCatalogService {
         await this.catalog.quarantine(stage.id, String(error));
         throw error;
       }
-      result = await binding.store.putFile({ key: intent.key }, path.join(this.root, stage.id), {
+      const options = {
+        signal: controller.signal,
         size: Number(stage.size),
-        expectedHash: { algorithm: 'sha256', hex: stage.hash! },
-      });
+        expectedHash: { algorithm: 'sha256' as const, hex: stage.hash! },
+        expectedFileIdentity: Object.freeze({ ...stage.identity! }),
+      };
+      const multipart = binding.store.s3Multipart;
+      if (multipart && binding.provider !== 's3') {
+        throw new Error('Multipart provider binding mismatch');
+      }
+      result = multipart
+        ? await multipart.putFile({ key: intent.key }, path.join(this.root, stage.id), {
+            ...options,
+            multipartAttemptToken: claim.token,
+            multipartJournal: (event) =>
+              this.catalog.recordMultipart(
+                {
+                  intentId: intent.id,
+                  storeId: intent.storeId,
+                  bucket: multipart.bucket,
+                  key: intent.key,
+                  token: claim.token!,
+                },
+                event,
+              ),
+          })
+        : await binding.store.putFile({ key: intent.key }, path.join(this.root, stage.id), options);
+      await stopRenewal();
+      controller.signal.throwIfAborted();
       return await this.catalog.acknowledge(intent.id, claim.token, result);
     } catch (error) {
-      await this.catalog.holdAttempt(
-        intent.id,
-        claim.token,
-        JSON.stringify({ error: String(error), receivedResult: result }),
-      );
+      await this.catalog
+        .holdAttempt(
+          intent.id,
+          claim.token,
+          JSON.stringify({
+            error: binding.store.s3Multipart ? 'Upload failed; uncertain outcome; hold for review' : String(error),
+            receivedResult: result,
+          }),
+        )
+        .catch(() => {});
       throw error;
+    } finally {
+      await stopRenewal();
     }
   }
 
@@ -270,6 +339,7 @@ export class ObjectCatalogService {
           pins: stage.pins,
           evidence: stage.evidence,
           intents,
+          multipart: await this.catalog.listMultipart(stage.id),
           versions,
         });
       }

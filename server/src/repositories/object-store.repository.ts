@@ -4,6 +4,7 @@ import { open } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
 import { finished } from 'node:stream/promises';
+import type { S3ObjectWriteOptions } from 'src/repositories/s3-object-store.repository.js';
 
 export interface ObjectIdentity {
   key: string;
@@ -20,7 +21,12 @@ export interface ObjectReadOptions {
   signal?: AbortSignal;
 }
 
+export type ObjectFileIdentity = Readonly<
+  Record<'dev' | 'ino' | 'size' | 'mtimeNs' | 'ctimeNs' | 'mode' | 'uid' | 'gid' | 'nlink', string>
+>;
+
 export interface ObjectWriteOptions {
+  expectedFileIdentity?: ObjectFileIdentity;
   size: number;
   expectedHash: { algorithm: 'sha1' | 'sha256'; hex: string };
   signal?: AbortSignal;
@@ -77,6 +83,10 @@ export const validateObjectRange = (range?: ObjectByteRange, size?: number) => {
 };
 
 export interface ObjectStore {
+  readonly s3Multipart?: Readonly<{
+    bucket: string;
+    putFile: (object: ObjectIdentity, stagingPath: string, options: S3ObjectWriteOptions) => Promise<ObjectWriteResult>;
+  }>;
   get(object: ObjectIdentity, options?: ObjectReadOptions): Promise<ObjectRead | undefined>;
   putFile(object: ObjectIdentity, stagingPath: string, options: ObjectWriteOptions): Promise<ObjectWriteResult>;
   delete(object: ObjectIdentity): Promise<void>;
@@ -88,13 +98,32 @@ export const openObjectFile = async (stagingPath: string, options: ObjectWriteOp
   }
   validateObjectWrite(options);
   options.signal?.throwIfAborted();
+  const identity =
+    options.expectedFileIdentity === undefined ? undefined : Object.freeze({ ...options.expectedFileIdentity });
   const file = await open(stagingPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const stats = await file.stat();
+    const stats = await file.stat({ bigint: true });
+    if (identity) {
+      const fields = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs', 'mode', 'uid', 'gid', 'nlink'] as const;
+      if (
+        !stats.isFile() ||
+        stats.nlink !== 1n ||
+        (stats.mode & 0o222n) !== 0n ||
+        stats.uid !== BigInt(process.getuid!()) ||
+        fields.some(
+          (key) =>
+            typeof identity[key] !== 'string' ||
+            !/^(0|[1-9][0-9]*)$/.test(identity[key]) ||
+            identity[key] !== stats[key].toString(),
+        )
+      ) {
+        throw new TypeError('Staged file identity mismatch');
+      }
+    }
     if (!stats.isFile()) {
       throw new TypeError('Staging source is not a regular file');
     }
-    if (stats.size !== options.size) {
+    if (stats.size !== BigInt(options.size)) {
       throw new RangeError('Object size differs from declared size');
     }
     options.signal?.throwIfAborted();

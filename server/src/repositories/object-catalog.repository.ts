@@ -1,12 +1,240 @@
 import { Kysely, sql } from 'kysely';
 import { randomUUID } from 'node:crypto';
 import { ObjectWriteResult } from 'src/repositories/object-store.repository.js';
+import { S3MultipartJournalEvent } from 'src/repositories/s3-object-store.repository.js';
 import { DB } from 'src/schema/index.js';
 import { VerificationObservation } from 'src/schema/tables/object-version.table.js';
 import { StageIdentity } from 'src/schema/tables/staged-object.table.js';
 
+const classify = (value: unknown) => (value instanceof Error ? 'error' : 'non-error');
+
+export interface MultipartBinding {
+  intentId: string;
+  storeId: string;
+  bucket: string;
+  key: string;
+  token: string;
+}
+
 export class ObjectCatalogRepository {
   constructor(private db: Kysely<DB>) {}
+
+  listMultipart(stageId: string) {
+    return this.db
+      .selectFrom('s3_multipart_journal')
+      .innerJoin('object_upload_intent', 'object_upload_intent.id', 's3_multipart_journal.intentId')
+      .selectAll('s3_multipart_journal')
+      .where('object_upload_intent.stageId', '=', stageId)
+      .execute();
+  }
+
+  async recordMultipart(binding: MultipartBinding, event: S3MultipartJournalEvent) {
+    if (event.bucket !== binding.bucket || event.key !== binding.key || event.attemptToken !== binding.token) {
+      throw new Error('Multipart binding mismatch');
+    }
+    if (event.phase === 'failure' || event.phase === 'abortResult') {
+      await this.db.transaction().execute(async (db) => {
+        const intent = await db
+          .selectFrom('object_upload_intent')
+          .selectAll()
+          .where('id', '=', binding.intentId)
+          .where('provider', '=', 's3')
+          .where('storeId', '=', binding.storeId)
+          .where('key', '=', binding.key)
+          .where('token', '=', binding.token)
+          .where('state', 'in', ['sending', 'ambiguous'])
+          .forUpdate()
+          .executeTakeFirstOrThrow();
+        const journal = await db
+          .selectFrom('s3_multipart_journal')
+          .selectAll()
+          .where('intentId', '=', intent.id)
+          .executeTakeFirstOrThrow();
+        if (
+          journal.bucket !== binding.bucket ||
+          journal.token !== binding.token ||
+          (event.uploadId !== undefined &&
+            (event.uploadId.length === 0 ||
+              Buffer.byteLength(event.uploadId) > 4096 ||
+              (journal.uploadId !== null && journal.uploadId !== event.uploadId)))
+        ) {
+          throw new Error('Multipart evidence binding mismatch');
+        }
+        if (event.phase === 'abortResult' && !['creating', 'uploading'].includes(journal.state)) {
+          throw new Error('Unexpected multipart abort evidence');
+        }
+        if (event.phase === 'failure') {
+          const states = {
+            beforeCreate: ['creating'],
+            create: ['creating'],
+            uploadCreated: ['creating', 'uploading'],
+            parts: ['uploading'],
+            beforeComplete: ['uploading', 'completing'],
+            complete: ['completing'],
+            receivedResult: ['completing', 'received'],
+          };
+          if (
+            !states[event.at]?.includes(journal.state) ||
+            event.completeDispatched !== ['complete', 'receivedResult'].includes(event.at) ||
+            (journal.uploadId !== null && event.uploadId !== journal.uploadId) ||
+            (event.receivedResult !== undefined && event.at !== 'receivedResult')
+          ) {
+            throw new Error('Unexpected multipart failure evidence state');
+          }
+        }
+        const response =
+          event.phase === 'failure' && event.receivedResult
+            ? {
+                ...(typeof event.receivedResult.versionId === 'string' &&
+                  Buffer.byteLength(event.receivedResult.versionId) <= 4096 && {
+                    versionId: event.receivedResult.versionId,
+                  }),
+                ...(typeof event.receivedResult.etag === 'string' &&
+                  Buffer.byteLength(event.receivedResult.etag) <= 4096 && { etag: event.receivedResult.etag }),
+              }
+            : undefined;
+        const observation =
+          event.phase === 'abortResult'
+            ? {
+                phase: event.phase,
+                uploadId: event.uploadId,
+                ok: event.outcome.ok,
+                ...(!event.outcome.ok && { reason: classify(event.outcome.reason) }),
+              }
+            : {
+                phase: event.phase,
+                at: event.at,
+                uploadId: event.uploadId,
+                completeDispatched: event.completeDispatched,
+                reason: classify(event.reason),
+                secondary: event.secondary.slice(0, 8).map((value) => classify(value)),
+              };
+        const evidence = [...journal.evidence.slice(0, 31), observation];
+        while (Buffer.byteLength(JSON.stringify(evidence)) > 30_000 && evidence.length > 2) {
+          evidence.splice(-2, 1);
+        }
+        await db
+          .updateTable('s3_multipart_journal')
+          .set({ evidence: sql`${evidence}::jsonb`, ...(response && journal.response === null && { response }) })
+          .where('intentId', '=', intent.id)
+          .execute();
+      });
+      return;
+    }
+    await this.db.transaction().execute(async (db) => {
+      const intent = await db
+        .selectFrom('object_upload_intent')
+        .selectAll()
+        .where('id', '=', binding.intentId)
+        .where('provider', '=', 's3')
+        .where('storeId', '=', binding.storeId)
+        .where('key', '=', binding.key)
+        .where('token', '=', binding.token)
+        .where('state', '=', 'sending')
+        .where('leaseUntil', '>', sql<Date>`clock_timestamp()`)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      const advance = async () => {
+        if (event.phase !== 'beforeCreate') {
+          const journal = await db
+            .selectFrom('s3_multipart_journal')
+            .selectAll()
+            .where('intentId', '=', intent.id)
+            .executeTakeFirstOrThrow();
+          if (
+            journal.bucket !== binding.bucket ||
+            journal.token !== binding.token ||
+            journal.storeId !== binding.storeId ||
+            journal.key !== binding.key
+          ) {
+            throw new Error('Multipart journal binding mismatch');
+          }
+          const validString = (value: unknown): value is string =>
+            typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 4096;
+          if (
+            !('uploadId' in event) ||
+            !validString(event.uploadId) ||
+            (journal.uploadId !== null && journal.uploadId !== event.uploadId)
+          ) {
+            throw new Error('Multipart UploadId mismatch');
+          }
+          if (event.phase === 'uploadCreated' && journal.state === 'creating') {
+            await db
+              .updateTable('s3_multipart_journal')
+              .set({ state: 'uploading', uploadId: event.uploadId })
+              .where('intentId', '=', intent.id)
+              .execute();
+            return;
+          }
+          if (
+            event.phase === 'beforeComplete' &&
+            journal.state === 'uploading' &&
+            event.parts.length === journal.partCount &&
+            event.parts.every((part, index) => part.PartNumber === index + 1 && validString(part.ETag))
+          ) {
+            await db
+              .updateTable('s3_multipart_journal')
+              .set({ state: 'completing', manifest: event.parts.map((part) => ({ ...part })) })
+              .where('intentId', '=', intent.id)
+              .execute();
+            return;
+          }
+          if (
+            event.phase === 'receivedResult' &&
+            journal.state === 'completing' &&
+            (event.versionId === undefined || validString(event.versionId)) &&
+            (event.etag === undefined || validString(event.etag))
+          ) {
+            await db
+              .updateTable('s3_multipart_journal')
+              .set({ state: 'received', response: { versionId: event.versionId, etag: event.etag } })
+              .where('intentId', '=', intent.id)
+              .execute();
+            return;
+          }
+          throw new Error('Unexpected multipart event or state');
+        }
+        const stage = await db
+          .selectFrom('staged_object')
+          .selectAll()
+          .where('id', '=', intent.stageId)
+          .executeTakeFirstOrThrow();
+        if (
+          event.size !== Number(stage.size) ||
+          event.expectedHash.algorithm !== 'sha256' ||
+          event.expectedHash.hex !== stage.hash ||
+          event.partCount !== Math.ceil(event.size / event.partSize)
+        ) {
+          throw new Error('Multipart source mismatch');
+        }
+        await db
+          .insertInto('s3_multipart_journal')
+          .values({
+            intentId: intent.id,
+            provider: 's3',
+            storeId: binding.storeId,
+            bucket: binding.bucket,
+            key: binding.key,
+            token: binding.token,
+            state: 'creating',
+            size: String(event.size),
+            hash: stage.hash!,
+            partSize: event.partSize,
+            partCount: event.partCount,
+          })
+          .execute();
+      };
+      await advance();
+      await db
+        .selectFrom('object_upload_intent')
+        .select('id')
+        .where('id', '=', intent.id)
+        .where('state', '=', 'sending')
+        .where('token', '=', binding.token)
+        .where('leaseUntil', '>', sql<Date>`clock_timestamp()`)
+        .executeTakeFirstOrThrow();
+    });
+  }
 
   async withCleanupLock<T>(id: string, action: (catalog: ObjectCatalogRepository) => Promise<T>) {
     return this.db.connection().execute(async (db) => {
@@ -160,7 +388,10 @@ export class ObjectCatalogRepository {
   expireSending(stageId: string) {
     return this.db
       .updateTable('object_upload_intent')
-      .set({ state: 'ambiguous', evidence: 'Sending lease expired: outcome unknown; hold, never retry automatically' })
+      .set({
+        state: 'ambiguous',
+        evidence: sql`concat_ws(E'\\n', evidence, 'Sending lease expired: outcome unknown; hold, never retry automatically')`,
+      })
       .where('stageId', '=', stageId)
       .where('state', '=', 'sending')
       .where('leaseUntil', '<=', sql<Date>`clock_timestamp()`)
@@ -204,6 +435,26 @@ export class ObjectCatalogRepository {
     });
   }
 
+  async renewSending(id: string, token: string, leaseMs: number) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 3_600_000) {
+      throw new Error('Invalid lease duration');
+    }
+    return this.db.transaction().execute(async (db) => {
+      await sql`SELECT set_config('statement_timeout', ${String(Math.min(leaseMs, 5000))}, true)`.execute(db);
+      await db.selectFrom('object_upload_intent').select('id').where('id', '=', id).forUpdate().executeTakeFirst();
+      const renewed = await db
+        .updateTable('object_upload_intent')
+        .set({ leaseUntil: sql`clock_timestamp() + ${leaseMs} * interval '1 millisecond'` })
+        .where('id', '=', id)
+        .where('token', '=', token)
+        .where('state', '=', 'sending')
+        .where('leaseUntil', '>', sql<Date>`clock_timestamp()`)
+        .returning('id')
+        .executeTakeFirst();
+      return !!renewed;
+    });
+  }
+
   startSending(id: string, leaseMs: number) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 3_600_000) {
       throw new Error('Invalid lease duration');
@@ -223,6 +474,12 @@ export class ObjectCatalogRepository {
 
   async acknowledge(id: string, token: string, result: ObjectWriteResult) {
     return this.db.transaction().execute(async (db) => {
+      await db
+        .selectFrom('object_upload_intent')
+        .select('id')
+        .where('id', '=', id)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
       const intent = await db
         .updateTable('object_upload_intent')
         .set({ state: 'acknowledged' })
@@ -232,6 +489,20 @@ export class ObjectCatalogRepository {
         .where('leaseUntil', '>', sql<Date>`clock_timestamp()`)
         .returningAll()
         .executeTakeFirstOrThrow();
+      const journal = await db
+        .selectFrom('s3_multipart_journal')
+        .selectAll()
+        .where('intentId', '=', id)
+        .executeTakeFirst();
+      if (
+        journal &&
+        (journal.state !== 'received' ||
+          journal.token !== token ||
+          journal.response?.versionId !== result.object.versionId ||
+          journal.response?.etag !== result.etag)
+      ) {
+        throw new Error('Multipart response does not match acknowledgement');
+      }
       if (
         result.object.key !== intent.key ||
         (intent.provider === 's3'
@@ -240,7 +511,7 @@ export class ObjectCatalogRepository {
       ) {
         throw new Error('Provider returned an invalid exact identity');
       }
-      return db
+      const version = await db
         .insertInto('object_version')
         .values({
           id: randomUUID(),
@@ -253,6 +524,15 @@ export class ObjectCatalogRepository {
         })
         .returningAll()
         .executeTakeFirstOrThrow();
+      await db
+        .selectFrom('object_upload_intent')
+        .select('id')
+        .where('id', '=', id)
+        .where('token', '=', token)
+        .where('state', '=', 'acknowledged')
+        .where('leaseUntil', '>', sql<Date>`clock_timestamp()`)
+        .executeTakeFirstOrThrow();
+      return version;
     });
   }
 

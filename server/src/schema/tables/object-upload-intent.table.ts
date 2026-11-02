@@ -12,6 +12,7 @@ import {
 import { StagedObjectTable } from 'src/schema/tables/staged-object.table.js';
 
 @Table('object_upload_intent')
+@Unique({ columns: ['id', 'provider', 'storeId', 'key', 'token'] })
 @Unique({ columns: ['id', 'provider', 'storeId', 'key'] })
 @Unique({ columns: ['provider', 'storeId', 'key'] })
 @Check({

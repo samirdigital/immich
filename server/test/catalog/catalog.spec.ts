@@ -1,3 +1,4 @@
+import { S3Client } from '@aws-sdk/client-s3';
 import { schemaFromCode } from '@immich/sql-tools';
 import { Kysely, sql } from 'kysely';
 import { PostgresJSDialect } from 'kysely-postgres-js';
@@ -18,16 +19,21 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { buffer } from 'node:stream/consumers';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import postgres from 'postgres';
 import { LocalObjectStoreRepository } from 'src/repositories/local-object-store.repository.js';
 import { ObjectCatalogRepository } from 'src/repositories/object-catalog.repository.js';
 import { ObjectStore } from 'src/repositories/object-store.repository.js';
+import { S3ObjectStoreRepository } from 'src/repositories/s3-object-store.repository.js';
 import { DB, ImmichDatabase } from 'src/schema/index.js';
 import { down, up } from 'src/schema/migrations/1793500000000-AddObjectCatalog.js';
+import { down as downMultipart, up as upMultipart } from 'src/schema/migrations/1793500001000-AddS3MultipartJournal.js';
 import { ObjectCatalogService } from 'src/services/object-catalog.service.js';
 
 const socket = process.env.CATALOG_TEST_SOCKET;
@@ -49,6 +55,7 @@ beforeAll(async () => {
   await admin.unsafe(`CREATE DATABASE "${database}"`);
   db = new Kysely<DB>({ dialect: new PostgresJSDialect({ postgres: postgres({ ...options, database }) }) });
   await up(db);
+  await upMultipart(db);
 });
 afterAll(async () => {
   await db?.destroy();
@@ -855,16 +862,20 @@ it('records lossless ownership and hardlink stat fields alongside inode identity
   });
 });
 
-async function crashWorker(action: string, stageId = '') {
+async function crashWorker(action: string, stageId = '', endpoint = '') {
   await expect(
-    promisify(execFile)(process.execPath, ['test/catalog/crash-worker.mjs', action, database, root, source, stageId], {
-      env: {
-        ...process.env,
-        CATALOG_TEST_DISPOSABLE: 'YES',
-        CATALOG_TEST_SOCKET: socket!,
-        CATALOG_TEST_PORT: String(options.port),
+    promisify(execFile)(
+      process.execPath,
+      ['test/catalog/crash-worker.mjs', action, database, root, source, stageId, endpoint],
+      {
+        env: {
+          ...process.env,
+          CATALOG_TEST_DISPOSABLE: 'YES',
+          CATALOG_TEST_SOCKET: socket!,
+          CATALOG_TEST_PORT: String(options.port),
+        },
       },
-    }),
+    ),
   ).rejects.toMatchObject({ code: 73 });
 }
 
@@ -931,10 +942,630 @@ it.each(['deleting', 'unlinked'])(
 );
 
 it('new migration alone can revert and reapply without extensions or the upstream chain', async () => {
+  await downMultipart(db);
   await down(db);
   const result = await sql<{
     name: string;
   }>`SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'`.execute(db);
   expect(result.rows).toEqual([]);
   await up(db);
+  await upMultipart(db);
+});
+
+async function s3Loopback(stageId: string, partDelayMs = 0) {
+  const parts: Buffer[] = [];
+  const requests: string[] = [];
+  const failures: unknown[] = [];
+  let completed = Buffer.alloc(0);
+  const server = createServer((request, response) => {
+    void (async () => {
+      const url = new URL(request.url!, 'http://localhost');
+      requests.push(`${request.method} ${url.search}`);
+      const [journal] = await repository.listMultipart(stageId);
+      if (url.searchParams.has('uploads')) {
+        expect(journal.state).toBe('creating');
+        response.end(
+          '<InitiateMultipartUploadResult><UploadId>loopback-upload</UploadId></InitiateMultipartUploadResult>',
+        );
+      } else
+        switch (request.method) {
+          case 'PUT': {
+            expect(journal.state).toBe('uploading');
+            expect(journal.uploadId).toBe('loopback-upload');
+            parts.push(await buffer(request));
+            await delay(partDelayMs);
+            response.setHeader('etag', `"part-${parts.length}"`);
+            response.end();
+
+            break;
+          }
+          case 'POST': {
+            expect(journal.state).toBe('completing');
+            expect(journal.manifest).toHaveLength(parts.length);
+            await buffer(request);
+            completed = Buffer.concat(parts);
+            response.setHeader('x-amz-version-id', 'loopback-exact-version');
+            response.end(
+              '<CompleteMultipartUploadResult><ETag>"opaque-complete"</ETag></CompleteMultipartUploadResult>',
+            );
+
+            break;
+          }
+          case 'DELETE': {
+            response.statusCode = 204;
+            response.end();
+
+            break;
+          }
+          case 'GET': {
+            expect(url.searchParams.get('versionId')).toBe('loopback-exact-version');
+            response.setHeader('x-amz-version-id', 'loopback-exact-version');
+            response.setHeader('content-length', completed.length);
+            response.end(completed);
+
+            break;
+          }
+          default: {
+            throw new Error('Unexpected loopback operation');
+          }
+        }
+    })().catch((error: unknown) => {
+      failures.push(error);
+      response.statusCode = 500;
+      response.end();
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address() as { port: number };
+  const client = new S3Client({
+    region: 'us-east-1',
+    endpoint: `http://127.0.0.1:${address.port}`,
+    forcePathStyle: true,
+    maxAttempts: 1,
+    credentials: { accessKeyId: 'synthetic', secretAccessKey: 'synthetic' },
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
+  });
+  const partSize = 5 * 1024 ** 2;
+  const store = new S3ObjectStoreRepository(client, {
+    bucket: 'synthetic-bucket',
+    multipart: { threshold: partSize, partSize, maxObjectSize: partSize * 10, cleanupTimeoutMs: 1000 },
+  });
+  return {
+    store,
+    requests,
+    failures,
+    endpoint: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      client.destroy();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+it.each([
+  ['mpu-beforeCreate', 'creating', 0],
+  ['mpu-create-response', 'creating', 1],
+  ['mpu-uploadCreated', 'uploading', 1],
+  ['mpu-beforeComplete', 'completing', 3],
+  ['mpu-remote-completed', 'received', 4],
+] as const)(
+  'process crash at %s retains durable %s evidence and never retries or aborts on recovery',
+  async (boundary, state, requestCount) => {
+    await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+    const stage = await service.stage(source);
+    const fixture = await s3Loopback(stage.id);
+    try {
+      await crashWorker(boundary, stage.id, fixture.endpoint);
+      const [intent] = await repository.listIntents(stage.id);
+      const [journal] = await repository.listMultipart(stage.id);
+      expect(journal.state).toBe(state);
+      expect(journal.uploadId).toBe(state === 'creating' ? null : 'loopback-upload');
+      if (state === 'received') {
+        expect(journal.response?.versionId).toBe('loopback-exact-version');
+      }
+      expect(await repository.listVersions(stage.id)).toEqual([]);
+      await db
+        .updateTable('object_upload_intent')
+        .set({ leaseUntil: sql`clock_timestamp() - interval '1 second'` })
+        .where('id', '=', intent.id)
+        .execute();
+      const report = await new ObjectCatalogService(new ObjectCatalogRepository(db), root).recover();
+      expect(report.held.find((entry) => entry.stageId === stage.id)?.multipart).toEqual([journal]);
+      await repository.releaseStage(stage.id);
+      expect(await service.cleanup(stage.id)).toBe(false);
+      expect(fixture.requests).toHaveLength(requestCount);
+      expect(fixture.failures).toEqual([]);
+      const multipartObservation14 = await readFile(path.join(root, stage.id));
+      expect(multipartObservation14.length).toBe(Number(stage.size));
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+it('cancels the provider cooperatively on a stuck renewal, awaits it, and retains the stage hold', async () => {
+  await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+  const stage = await service.stage(source);
+  const fixture = await s3Loopback(stage.id, 450);
+  let settled = false;
+  const renew = vi.spyOn(repository, 'renewSending').mockImplementation(async () => {
+    await delay(650);
+    settled = true;
+    return false;
+  });
+  try {
+    await expect(
+      service.upload(stage.id, { provider: 's3', storeId: 'physical-loopback-1', store: fixture.store }, 300),
+    ).rejects.toThrow();
+    expect(settled).toBe(true);
+    expect(fixture.requests.filter((request) => request.startsWith('PUT'))).toHaveLength(1);
+    const multipartObservation13 = await repository.listIntents(stage.id);
+    expect(multipartObservation13[0].state).toBe('ambiguous');
+    const multipartObservation12 = await repository.listMultipart(stage.id);
+    expect(multipartObservation12[0].evidence.some((entry) => entry.phase === 'abortResult')).toBe(true);
+    await repository.releaseStage(stage.id);
+    expect(await service.cleanup(stage.id)).toBe(false);
+    const calls = renew.mock.calls.length;
+    await delay(350);
+    expect(renew).toHaveBeenCalledTimes(calls);
+  } finally {
+    renew.mockRestore();
+    await fixture.close();
+  }
+});
+
+it('renews the fenced DB lease throughout a long SDK write and settles renewal before returning', async () => {
+  await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+  const stage = await service.stage(source);
+  const fixture = await s3Loopback(stage.id, 450);
+  const renew = vi.spyOn(repository, 'renewSending');
+  try {
+    const version = await service.upload(
+      stage.id,
+      { provider: 's3', storeId: 'physical-loopback-1', store: fixture.store },
+      300,
+    );
+    expect(version.versionId).toBe('loopback-exact-version');
+    expect(renew.mock.calls.length).toBeGreaterThan(2);
+    const calls = renew.mock.calls.length;
+    await delay(350);
+    expect(renew).toHaveBeenCalledTimes(calls);
+    expect(fixture.failures).toEqual([]);
+  } finally {
+    renew.mockRestore();
+    await fixture.close();
+  }
+});
+
+it('integrates actual SDK multipart checkpoints with durable catalog and independent full GET before cleanup', async () => {
+  await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+  const stage = await service.stage(source);
+  const fixture = await s3Loopback(stage.id);
+  try {
+    const binding = { provider: 's3' as const, storeId: 'physical-loopback-1', store: fixture.store };
+    const version = await service.upload(stage.id, binding);
+    expect(version.versionId).toBe('loopback-exact-version');
+    const multipartObservation11 = await repository.listMultipart(stage.id);
+    expect(multipartObservation11[0].response).toEqual({
+      versionId: version.versionId,
+      etag: version.etag,
+    });
+    await repository.releaseStage(stage.id);
+    expect(await service.cleanup(stage.id)).toBe(false);
+    expect(await service.verify(stage.id, version.id, binding)).toBe(true);
+    expect(await service.cleanup(stage.id)).toBe(true);
+    expect(fixture.failures).toEqual([]);
+    expect(fixture.requests).toHaveLength(5);
+  } finally {
+    await fixture.close();
+  }
+});
+
+it.each(['creating', 'uploading', 'received', 'acknowledge'] as const)(
+  'real DB failure at %s preserves durable holds and available response evidence',
+  async (boundary) => {
+    await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+    const stage = await service.stage(source);
+    const fixture = await s3Loopback(stage.id);
+    if (boundary === 'acknowledge') {
+      await sql`ALTER TABLE object_version ADD CONSTRAINT multipart_test_fail CHECK (false) NOT VALID`.execute(db);
+    } else {
+      await sql`ALTER TABLE s3_multipart_journal ADD CONSTRAINT multipart_test_fail CHECK (state <> ${sql.lit(boundary)}) NOT VALID`.execute(
+        db,
+      );
+    }
+    try {
+      await expect(
+        service.upload(stage.id, { provider: 's3', storeId: 'physical-loopback-1', store: fixture.store }),
+      ).rejects.toThrow();
+      const [intent] = await repository.listIntents(stage.id);
+      expect(intent.state).toBe('ambiguous');
+      expect(await repository.listVersions(stage.id)).toEqual([]);
+      const [journal] = await repository.listMultipart(stage.id);
+      if (boundary === 'creating') {
+        expect(journal).toBeUndefined();
+        expect(fixture.requests).toHaveLength(0);
+      } else if (boundary === 'uploading') {
+        expect(journal.state).toBe('creating');
+        expect(
+          journal.evidence.some((entry) => entry.phase === 'abortResult' && entry.uploadId === 'loopback-upload'),
+        ).toBe(true);
+        expect(fixture.requests.some((entry) => entry.startsWith('PUT'))).toBe(false);
+      } else {
+        expect(journal.state).toBe(boundary === 'received' ? 'completing' : 'received');
+        expect(journal.response?.versionId).toBe('loopback-exact-version');
+        expect(fixture.requests.some((entry) => entry.startsWith('DELETE'))).toBe(false);
+      }
+      await repository.releaseStage(stage.id);
+      expect(await service.cleanup(stage.id)).toBe(false);
+      const multipartObservation10 = await readFile(path.join(root, stage.id));
+      expect(multipartObservation10.length).toBe(Number(stage.size));
+      expect(fixture.failures).toEqual([]);
+    } finally {
+      if (boundary === 'acknowledge') {
+        await sql`ALTER TABLE object_version DROP CONSTRAINT multipart_test_fail`.execute(db);
+      } else {
+        await sql`ALTER TABLE s3_multipart_journal DROP CONSTRAINT multipart_test_fail`.execute(db);
+      }
+      await fixture.close();
+    }
+  },
+);
+
+it.each(['bucket', 'key', 'token', 'storeId', 'intentId'] as const)(
+  'fences mismatched multipart %s binding before journal effects',
+  async (field) => {
+    const { stage, binding, base } = await multipartClaim();
+    const wrong = { ...binding, [field]: ['token', 'intentId'].includes(field) ? randomUUID() : 'wrong' };
+    await expect(
+      repository.recordMultipart(wrong, { ...base, phase: 'uploadCreated', uploadId: 'u' }),
+    ).rejects.toThrow();
+    const multipartObservation9 = await repository.listMultipart(stage.id);
+    expect(multipartObservation9[0].state).toBe('creating');
+  },
+);
+
+it('rejects event replays, misbound upload IDs and invalid ordered manifests', async () => {
+  const { stage, binding, base } = await multipartClaim();
+  await repository.recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'u' });
+  await expect(
+    repository.recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'u' }),
+  ).rejects.toThrow();
+  await expect(
+    repository.recordMultipart(binding, {
+      ...base,
+      phase: 'beforeComplete',
+      uploadId: 'other',
+      parts: [{ PartNumber: 1, ETag: 'p' }],
+    }),
+  ).rejects.toThrow();
+  for (const parts of [[], [{ PartNumber: 2, ETag: 'p' }], [{ PartNumber: 1, ETag: '' }]]) {
+    await expect(
+      repository.recordMultipart(binding, { ...base, phase: 'beforeComplete', uploadId: 'u', parts }),
+    ).rejects.toThrow();
+  }
+  await expect(
+    repository.recordMultipart(binding, { ...base, phase: 'receivedResult', uploadId: 'u', versionId: 'v', etag: 'e' }),
+  ).rejects.toThrow();
+  const multipartObservation8 = await repository.listMultipart(stage.id);
+  expect(multipartObservation8[0].state).toBe('uploading');
+});
+
+it.each([
+  ['local', 'replace'],
+  ['local', 'mutate'],
+  ['s3', 'replace'],
+  ['s3', 'mutate'],
+] as const)(
+  'rejects %s %s in the validation to provider-open gap on the provider owned descriptor',
+  async (provider, kind) => {
+    if (provider === 's3') {
+      await writeFile(source, Buffer.alloc(5 * 1024 ** 2 + 17, 29));
+    }
+    const stage = await service.stage(source);
+    const remote = path.join(directory, 'remote');
+    await mkdir(remote);
+    const fixture = provider === 's3' ? await s3Loopback(stage.id) : undefined;
+    const store = fixture?.store ?? new LocalObjectStoreRepository(remote);
+    const put = store.putFile.bind(store);
+    const bytes = await readFile(path.join(root, stage.id));
+    store.putFile = async (...args: Parameters<ObjectStore['putFile']>) => {
+      if (kind === 'replace') {
+        await rename(args[1], path.join(directory, 'old-inode'));
+        await writeFile(args[1], bytes, { mode: 0o400 });
+      } else {
+        await chmod(args[1], 0o600);
+        await writeFile(args[1], bytes);
+      }
+      return put(...args);
+    };
+    try {
+      await expect(service.upload(stage.id, { provider, storeId: 'physical-1', store })).rejects.toThrow('identity');
+      expect(await readdir(remote)).toEqual([]);
+      expect(fixture?.requests ?? []).toEqual([]);
+      const [intent] = await repository.listIntents(stage.id);
+      expect(intent.state).toBe('ambiguous');
+    } finally {
+      await fixture?.close();
+    }
+  },
+);
+
+async function multipartClaim() {
+  const stage = await service.stage(source);
+  const intent = await repository.prepare(stage.id, 's3', 'physical-store-1');
+  const claim = await repository.startSending(intent.id, 60_000);
+  const binding = {
+    intentId: intent.id,
+    storeId: intent.storeId,
+    bucket: 'synthetic-bucket',
+    key: intent.key,
+    token: claim!.token!,
+  };
+  const base = { bucket: binding.bucket, key: binding.key, attemptToken: binding.token };
+  await repository.recordMultipart(binding, {
+    ...base,
+    phase: 'beforeCreate',
+    size: Number(stage.size),
+    expectedHash: { algorithm: 'sha256', hex: stage.hash! },
+    partSize: 5 * 1024 ** 2,
+    partCount: 1,
+  });
+  return { stage, intent, binding, base };
+}
+
+it('rolls back acknowledgement if the lease expires during version insertion', async () => {
+  const stage = await service.stage(source);
+  const intent = await repository.prepare(stage.id, 'local', 'physical-1');
+  const claim = await repository.startSending(intent.id, 150);
+  await sql`CREATE FUNCTION catalog_test_slow_version() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN NEW; END $$`.execute(
+    db,
+  );
+  await sql`CREATE TRIGGER catalog_test_slow_version BEFORE INSERT ON object_version FOR EACH ROW EXECUTE FUNCTION catalog_test_slow_version()`.execute(
+    db,
+  );
+  try {
+    await expect(repository.acknowledge(intent.id, claim!.token!, { object: { key: intent.key } })).rejects.toThrow();
+    expect(await repository.listVersions(stage.id)).toEqual([]);
+    const held = await repository.getIntent(intent.id);
+    expect(held.state).toBe('sending');
+  } finally {
+    await sql`DROP TRIGGER catalog_test_slow_version ON object_version`.execute(db);
+    await sql`DROP FUNCTION catalog_test_slow_version()`.execute(db);
+  }
+});
+
+it('fences a forward journal transition after waiting past lease expiry on a row lock', async () => {
+  const { intent, binding, base, stage } = await multipartClaim();
+  await db
+    .updateTable('object_upload_intent')
+    .set({ leaseUntil: sql`clock_timestamp() + interval '100 milliseconds'` })
+    .where('id', '=', intent.id)
+    .execute();
+  let pending: Promise<unknown>;
+  await db.transaction().execute(async (tx) => {
+    await tx.selectFrom('object_upload_intent').selectAll().where('id', '=', intent.id).forUpdate().execute();
+    pending = repository
+      .recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'late' })
+      .then(() => 'advanced')
+      .catch(() => 'fenced');
+    await delay(300);
+  });
+  expect(await pending!).toBe('fenced');
+  const multipartObservation6 = await repository.listMultipart(stage.id);
+  expect(multipartObservation6[0].state).toBe('creating');
+});
+
+it('never renews a claim that expired while waiting for a row lock', async () => {
+  const { intent, binding } = await multipartClaim();
+  await db
+    .updateTable('object_upload_intent')
+    .set({ leaseUntil: sql`clock_timestamp() + interval '100 milliseconds'` })
+    .where('id', '=', intent.id)
+    .execute();
+  let pending: Promise<boolean>;
+  await db.transaction().execute(async (tx) => {
+    await tx.selectFrom('object_upload_intent').selectAll().where('id', '=', intent.id).forUpdate().execute();
+    pending = repository.renewSending(intent.id, binding.token, 60_000);
+    await delay(300);
+  });
+  expect(await pending!).toBe(false);
+});
+
+it('renews only the live exact claim using database time and never revives an expired token', async () => {
+  const { intent, binding } = await multipartClaim();
+  const first = await repository.getIntent(intent.id);
+  expect(await repository.renewSending(intent.id, randomUUID(), 60_000)).toBe(false);
+  expect(await repository.renewSending(intent.id, binding.token, 60_000)).toBe(true);
+  const multipartObservation5 = await repository.getIntent(intent.id);
+  expect(new Date(multipartObservation5.leaseUntil!).getTime()).toBeGreaterThanOrEqual(
+    new Date(first.leaseUntil!).getTime(),
+  );
+  await db
+    .updateTable('object_upload_intent')
+    .set({ leaseUntil: sql`clock_timestamp() - interval '1 second'` })
+    .where('id', '=', intent.id)
+    .execute();
+  expect(await repository.renewSending(intent.id, binding.token, 60_000)).toBe(false);
+});
+
+it('database constrains journal state shape and restricts the exact claim identity', async () => {
+  const { intent, stage } = await multipartClaim();
+  await expect(
+    db
+      .updateTable('s3_multipart_journal')
+      .set({ state: 'received', uploadId: 'u' })
+      .where('intentId', '=', intent.id)
+      .execute(),
+  ).rejects.toThrow();
+  await expect(
+    db.updateTable('s3_multipart_journal').set({ token: randomUUID() }).where('intentId', '=', intent.id).execute(),
+  ).rejects.toThrow();
+  await expect(db.deleteFrom('object_upload_intent').where('id', '=', intent.id).execute()).rejects.toThrow();
+  const code = schemaFromCode({ databaseName: 'immich' }).tables.find(
+    (table) => table.name === 's3_multipart_journal',
+  )!;
+  expect(new ImmichDatabase().tables.map((table) => table.name)).toContain('S3MultipartJournalTable');
+  const indexes = await sql<{
+    indexname: string;
+  }>`SELECT indexname FROM pg_indexes WHERE tablename = 's3_multipart_journal'`.execute(db);
+  expect(indexes.rows.map((row) => row.indexname)).toEqual(
+    expect.arrayContaining(code.indexes.map((index) => index.name)),
+  );
+  const evidenceColumns = code.columns.filter((column) => ['manifest', 'evidence'].includes(column.name));
+  for (const column of evidenceColumns) {
+    expect(column.default).toBe("'[]'::jsonb");
+  }
+  const multipartObservation4 = await repository.listMultipart(stage.id);
+  expect(multipartObservation4[0].state).toBe('creating');
+});
+
+it('bounds accumulated secondary evidence even with large opaque known upload identifiers', async () => {
+  const { stage, binding, base } = await multipartClaim();
+  const uploadId = 'u'.repeat(4096);
+  for (let index = 0; index < 40; index++) {
+    await repository.recordMultipart(binding, {
+      ...base,
+      phase: 'abortResult',
+      uploadId,
+      outcome: { ok: false, reason: new Error('SECRET'.repeat(10_000)) },
+    });
+  }
+  const [journal] = await repository.listMultipart(stage.id);
+  expect(journal.evidence.length).toBeLessThanOrEqual(32);
+  expect(Buffer.byteLength(JSON.stringify(journal.evidence))).toBeLessThanOrEqual(30_000);
+  expect(journal.evidence[0].uploadId).toBe(uploadId);
+  expect(JSON.stringify(journal.evidence)).not.toContain('SECRET');
+});
+
+it('rejects failure evidence for impossible event state without corrupting durable outcome history', async () => {
+  const { stage, binding, base } = await multipartClaim();
+  await repository.recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'known-id' });
+  await expect(
+    repository.recordMultipart(binding, {
+      ...base,
+      phase: 'failure',
+      at: 'complete',
+      uploadId: 'known-id',
+      completeDispatched: true,
+      reason: 'bad',
+      secondary: [],
+    }),
+  ).rejects.toThrow();
+  const multipartObservation3 = await repository.listMultipart(stage.id);
+  expect(multipartObservation3[0].evidence).toEqual([]);
+});
+
+it('retains bounded sanitized provider failure and abort observations after lease loss without advancing or asserting absence', async () => {
+  const { stage, intent, binding, base } = await multipartClaim();
+  await repository.recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'known-id' });
+  await db
+    .updateTable('object_upload_intent')
+    .set({ leaseUntil: sql`clock_timestamp() - interval '1 second'`, evidence: 'prior outcome' })
+    .where('id', '=', intent.id)
+    .execute();
+  await service.recover();
+  await repository.recordMultipart(binding, {
+    ...base,
+    phase: 'abortResult',
+    uploadId: 'known-id',
+    outcome: { ok: false, reason: new Error('SECRET'.repeat(10_000)) },
+  });
+  await repository.recordMultipart(binding, {
+    ...base,
+    phase: 'failure',
+    at: 'parts',
+    uploadId: 'known-id',
+    completeDispatched: false,
+    reason: new Error('SECRET'),
+    secondary: [new Error('SECRET')],
+  });
+  const [journal] = await repository.listMultipart(stage.id);
+  expect(journal.state).toBe('uploading');
+  expect(journal.evidence).toHaveLength(2);
+  expect(JSON.stringify(journal.evidence)).not.toContain('SECRET');
+  expect(JSON.stringify(journal.evidence)).not.toContain('absent');
+  const multipartObservation2 = await repository.getIntent(intent.id);
+  expect(multipartObservation2.evidence).toContain('prior outcome');
+  await expect(
+    repository.recordMultipart(binding, {
+      ...base,
+      phase: 'beforeComplete',
+      uploadId: 'known-id',
+      parts: [{ PartNumber: 1, ETag: 'p' }],
+    }),
+  ).rejects.toThrow();
+});
+
+it('journals ordered completion and exact response before atomic acknowledgement', async () => {
+  const { stage, binding, base } = await multipartClaim();
+  await repository.recordMultipart(binding, { ...base, phase: 'uploadCreated', uploadId: 'opaque-upload' });
+  await expect(
+    repository.acknowledge(binding.intentId, binding.token, {
+      object: { key: binding.key, versionId: 'v1' },
+      etag: 'etag',
+    }),
+  ).rejects.toThrow();
+  await repository.recordMultipart(binding, {
+    ...base,
+    phase: 'beforeComplete',
+    uploadId: 'opaque-upload',
+    parts: [{ PartNumber: 1, ETag: 'opaque-part' }],
+  });
+  await repository.recordMultipart(binding, {
+    ...base,
+    phase: 'receivedResult',
+    uploadId: 'opaque-upload',
+    versionId: 'v1',
+    etag: 'etag',
+  });
+  await expect(
+    repository.acknowledge(binding.intentId, binding.token, {
+      object: { key: binding.key, versionId: 'other' },
+      etag: 'etag',
+    }),
+  ).rejects.toThrow();
+  const version = await repository.acknowledge(binding.intentId, binding.token, {
+    object: { key: binding.key, versionId: 'v1' },
+    etag: 'etag',
+  });
+  expect(version.versionId).toBe('v1');
+  const [journal] = await repository.listMultipart(stage.id);
+  expect(journal.state).toBe('received');
+  expect(journal.manifest).toEqual([{ PartNumber: 1, ETag: 'opaque-part' }]);
+  expect(journal.response).toEqual({ versionId: 'v1', etag: 'etag' });
+  await repository.releaseStage(stage.id);
+  expect(await service.cleanup(stage.id)).toBe(false);
+});
+
+it('durably journals creating bound to a live exact S3 claim before effects', async () => {
+  const stage = await service.stage(source);
+  const intent = await repository.prepare(stage.id, 's3', 'physical-store-1');
+  const claim = await repository.startSending(intent.id, 60_000);
+  const binding = {
+    intentId: intent.id,
+    storeId: intent.storeId,
+    bucket: 'synthetic-bucket',
+    key: intent.key,
+    token: claim!.token!,
+  };
+  await repository.recordMultipart(binding, {
+    bucket: binding.bucket,
+    key: intent.key,
+    attemptToken: binding.token,
+    phase: 'beforeCreate',
+    size: Number(stage.size),
+    expectedHash: { algorithm: 'sha256', hex: stage.hash! },
+    partSize: 5 * 1024 ** 2,
+    partCount: 1,
+  });
+  const [journal] = await repository.listMultipart(stage.id);
+  expect(journal.state).toBe('creating');
+  expect(journal.uploadId).toBeNull();
+  expect(journal.token).toBe(claim!.token);
+  const multipartObservation1 = await service.recover();
+  expect(multipartObservation1.held.find((entry) => entry.stageId === stage.id)?.multipart).toEqual([journal]);
 });

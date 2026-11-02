@@ -19,9 +19,49 @@ import {
   validateObjectRange,
   validateObjectWrite,
 } from 'src/repositories/object-store.repository.js';
+import { putMultipartFile, validateMultipartOptions } from 'src/repositories/s3-multipart.js';
+
+export interface S3MultipartOptions {
+  threshold: number;
+  partSize: number;
+  maxObjectSize: number;
+  cleanupTimeoutMs: number;
+}
+
+export interface S3ObjectWriteOptions extends ObjectWriteOptions {
+  multipartAttemptToken?: string;
+  multipartJournal?: (event: S3MultipartJournalEvent) => Promise<void>;
+}
+
+export type S3MultipartBoundary =
+  'beforeCreate' | 'create' | 'uploadCreated' | 'parts' | 'beforeComplete' | 'complete' | 'receivedResult';
+
+export type S3MultipartJournalEvent = { bucket: string; key: string; attemptToken: string } & (
+  | {
+      phase: 'beforeCreate';
+      size: number;
+      expectedHash: Readonly<ObjectWriteOptions['expectedHash']>;
+      partSize: number;
+      partCount: number;
+    }
+  | { phase: 'uploadCreated'; uploadId: string }
+  | { phase: 'beforeComplete'; uploadId: string; parts: readonly Readonly<{ PartNumber: number; ETag: string }>[] }
+  | { phase: 'receivedResult'; uploadId: string; versionId?: string; etag?: string }
+  | { phase: 'abortResult'; uploadId: string; outcome: { ok: true } | { ok: false; reason: unknown } }
+  | {
+      phase: 'failure';
+      at: S3MultipartBoundary;
+      uploadId?: string;
+      completeDispatched: boolean;
+      reason: unknown;
+      secondary: readonly unknown[];
+      receivedResult?: { versionId?: string; etag?: string };
+    }
+);
 
 export interface S3ObjectStoreOptions {
   bucket: string;
+  multipart?: S3MultipartOptions;
 }
 
 const isObjectMissing = (error: unknown) =>
@@ -39,7 +79,18 @@ export class S3ObjectStoreRepository implements ObjectStore {
   constructor(
     private client: S3Client,
     private options: S3ObjectStoreOptions,
-  ) {}
+  ) {
+    this.options = Object.freeze({
+      ...options,
+      ...(options.multipart && { multipart: Object.freeze({ ...options.multipart }) }),
+    });
+  }
+
+  get s3Multipart() {
+    return this.options.multipart
+      ? Object.freeze({ bucket: this.options.bucket, putFile: this.putFile.bind(this) })
+      : undefined;
+  }
 
   async get(object: ObjectIdentity, options: ObjectReadOptions = {}) {
     validateObjectIdentity(object);
@@ -109,12 +160,31 @@ export class S3ObjectStoreRepository implements ObjectStore {
     }
   }
 
-  async putFile(object: ObjectIdentity, stagingPath: string, options: ObjectWriteOptions) {
+  async putFile(object: ObjectIdentity, stagingPath: string, options: S3ObjectWriteOptions) {
     validateObjectIdentity(object);
     if (object.versionId !== undefined) {
       throw new TypeError('A PUT creates a new object version');
     }
     validateObjectWrite(options);
+    if (this.options.multipart) {
+      validateMultipartOptions(this.options.multipart, options.size);
+    }
+    if (this.options.multipart && options.size >= this.options.multipart.threshold) {
+      if (typeof options.multipartJournal !== 'function') {
+        throw new TypeError('A durable multipart journal is required');
+      }
+      if (typeof options.multipartAttemptToken !== 'string' || options.multipartAttemptToken.length === 0) {
+        throw new TypeError('A multipart attempt token is required');
+      }
+      return putMultipartFile(
+        this.client,
+        this.options.bucket,
+        { ...object },
+        stagingPath,
+        { ...options, expectedHash: { ...options.expectedHash } },
+        { ...this.options.multipart },
+      );
+    }
     if (options.size > 5 * 1024 ** 3) {
       throw new RangeError('Object exceeds single PUT limit');
     }

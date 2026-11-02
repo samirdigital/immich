@@ -1,3 +1,5 @@
+import { S3Client } from '@aws-sdk/client-s3';
+import { S3ObjectStoreRepository } from '../../dist/repositories/s3-object-store.repository.js';
 import { Kysely } from 'kysely';
 import fs from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
@@ -10,7 +12,7 @@ import { LocalObjectStoreRepository } from '../../dist/repositories/local-object
 import { ObjectCatalogRepository } from '../../dist/repositories/object-catalog.repository.js';
 import { ObjectCatalogService } from '../../dist/services/object-catalog.service.js';
 
-const [action, database, root, source, stageId] = process.argv.slice(2);
+const [action, database, root, source, stageId, endpoint] = process.argv.slice(2);
 if (
   process.env.CATALOG_TEST_DISPOSABLE !== 'YES' ||
   !/^immich_catalog_test_[a-f0-9]{32}$/.test(database) ||
@@ -66,6 +68,40 @@ if (['paused-cleanup', 'paused-recover', 'recover-before-ack'].includes(action))
   await db.destroy();
   process.disconnect();
   process.exit(0);
+}
+if (action.startsWith('mpu-')) {
+  if (!/^http:\/\/127\.0\.0\.1:[0-9]+$/.test(endpoint)) {
+    throw new Error('Loopback only');
+  }
+  const client = new S3Client({
+    region: 'us-east-1',
+    endpoint,
+    forcePathStyle: true,
+    maxAttempts: 1,
+    credentials: { accessKeyId: 'synthetic', secretAccessKey: 'synthetic' },
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
+  });
+  const partSize = 5 * 1024 ** 2;
+  const store = new S3ObjectStoreRepository(client, {
+    bucket: 'synthetic-bucket',
+    multipart: { threshold: partSize, partSize, maxObjectSize: partSize * 10, cleanupTimeoutMs: 1000 },
+  });
+  const record = catalog.recordMultipart.bind(catalog);
+  catalog.recordMultipart = async (binding, event) => {
+    if (action === 'mpu-create-response' && event.phase === 'uploadCreated') {
+      exit();
+    }
+    await record(binding, event);
+    if (action === `mpu-${event.phase}`) {
+      exit();
+    }
+  };
+  if (action === 'mpu-remote-completed') {
+    catalog.acknowledge = exit;
+  }
+  await service.upload(stageId, { provider: 's3', storeId: 'physical-loopback-1', store });
+  throw new Error('Multipart crash boundary was not reached');
 }
 if (action === 'creating') {
   const create = catalog.createStage.bind(catalog);

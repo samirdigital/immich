@@ -272,6 +272,9 @@ describe(S3ObjectStoreRepository.name, () => {
               },
           });
           const { S3ObjectStoreRepository } = load('s3-object-store.repository', {
+            'src/repositories/s3-multipart.js': load('s3-multipart', {
+              'src/repositories/object-store.repository.js': objectStore,
+            }),
             'src/repositories/object-store.repository.js': {
               ...objectStore,
               createObjectValidator(options) {

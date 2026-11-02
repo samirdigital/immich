@@ -75,6 +75,7 @@ import { PersonUserTable } from 'src/schema/tables/person-user.table.js';
 import { PersonTable } from 'src/schema/tables/person.table.js';
 import { PluginMethodTable } from 'src/schema/tables/plugin-method.table.js';
 import { PluginTable } from 'src/schema/tables/plugin.table.js';
+import { S3MultipartJournalTable } from 'src/schema/tables/s3-multipart-journal.table.js';
 import { SessionTable } from 'src/schema/tables/session.table.js';
 import { SharedLinkAssetTable } from 'src/schema/tables/shared-link-asset.table.js';
 import { SharedLinkTable } from 'src/schema/tables/shared-link.table.js';
@@ -108,6 +109,7 @@ export class ImmichDatabase {
     StagedObjectTable,
     ObjectUploadIntentTable,
     ObjectVersionTable,
+    S3MultipartJournalTable,
     ActivityTable,
     AlbumAssetTable,
     AlbumAssetAuditTable,
@@ -217,6 +219,7 @@ export interface DB {
   staged_object: StagedObjectTable;
   object_upload_intent: ObjectUploadIntentTable;
   object_version: ObjectVersionTable;
+  s3_multipart_journal: S3MultipartJournalTable;
   kysely_migrations: { timestamp: string; name: string };
 
   activity: ActivityTable;

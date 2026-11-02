@@ -2,7 +2,7 @@
 
 Status: development-only groundwork for Backblaze B2 via its S3-compatible API. This branch does **not** yet store Immich uploads in B2 and is not ready for a personal-media import.
 
-The isolated [durable staging and object catalog](OBJECT_CATALOG_DEVELOPMENT.md) now adds owned staging, durable intents, exact-version verification and conservative cleanup/recovery. It is not wired into the application; the provider contract below remains unchanged.
+The isolated [durable staging and object catalog](OBJECT_CATALOG_DEVELOPMENT.md) now adds owned staging, durable intents, exact-version verification and conservative cleanup/recovery. It is not wired into the application. The file-only provider contract below now has a separate [opt-in sequential multipart slice](MULTIPART_PROVIDER_DEVELOPMENT.md), disabled by default, NOT live qualified, and integrated with an isolated PostgreSQL catalog journal adapter (not application uploads).
 
 ## What exists
 
@@ -23,7 +23,7 @@ The provider opens the final staging component with `O_RDONLY | O_NOFOLLOW | O_N
 
 A bounded transform counts and hashes every source byte, checks size while reading and at EOF, and checks the expected digest before its readable end. Source reads and transform queues use 64 KiB high-water marks and respect backpressure; the complete file is not buffered in memory. Local writes finish this validation and flush the exclusive temporary output before renaming. S3 writes require both complete validated body consumption and successful SDK transfer before returning a required version identity. An early response with an unread body is rejected, including an early HTTP success: it is not a validated upload success.
 
-Source/transform errors abort a provider-owned controller, combined with the caller signal without aborting the caller's controller. This explicitly cancels the SDK's native Node HTTP request, which uses piping rather than automatically propagating source errors. Transport failures and cancellation tear down the owned reader and validator too. Both the SDK promise and the source pipeline settle before return/rejection; the first failure object is retained and owned stream/signal listeners are cleaned up. No arbitrary-stream destroy callback, polling loop, or cleanup timeout is involved. Test deadlines are only failure guards.
+Source/transform errors abort a provider-owned controller, combined with the caller signal without aborting the caller's controller. This explicitly cancels the SDK's native Node HTTP request, which uses piping rather than automatically propagating source errors. Transport failures and cancellation tear down the owned reader and validator too. Both the SDK promise and the source pipeline settle before return/rejection; the first failure object is retained and owned stream/signal listeners are cleaned up. Single-PUT stream teardown uses no arbitrary-stream destroy callback, polling loop, or cleanup timeout. The opt-in multipart path separately bounds its cooperative AbortMultipartUpload cleanup request; it does not abandon running transfer/pipeline work. Test deadlines are only failure guards.
 
 **A matching source hash is not remote-byte verification.** A response, version ID, or opaque ETag cannot establish that durable remote bytes match the original. An interrupted, hash-rejected, early-response, or otherwise ambiguous PUT can still have created a remote version; there is no automatic unpinned compensating delete. Retain staging data and recoverable operation intent until a future orchestrator reconciles the exact provider outcome and independently verifies content.
 
@@ -31,11 +31,11 @@ Source/transform errors abort a provider-owned controller, combined with the cal
 
 - Application upload/download integration, asset-to-object mappings and application dependency injection.
 - Application-facing integrity/recovery jobs; the isolated catalog now implements verification and durable state.
-- Multipart uploads, resumable uploads and retry-safe replay of consumed streams.
+- Multipart resume/reconciliation and retry-safe replay of consumed streams. The isolated durable multipart catalog adapter is not application integration or a B2 qualification.
 - Materialization leases/cache policy for native media tools and generated-media upload.
 - A complete backup/restore/export path or verified B2 endpoint configuration.
 
-The S3 writer currently accepts known-length single PUT only, with a 5 GiB guard. Large-video support requires a separate multipart implementation before application integration. A failed or ambiguous remote PUT is not a claim that no object exists: the caller must retain recoverable intent and reconcile provider outcomes.
+By default the S3 writer accepts known-length single PUT only, with a 5 GiB guard. The opt-in multipart provider requires explicit bounds and an awaited journal contract; independent review, operational hardening and live qualification are still required before application integration. A failed or ambiguous remote PUT is not a claim that no object exists: the caller must retain recoverable intent and reconcile provider outcomes.
 
 The injected S3 client owns endpoint, region, scoped credentials, request/response checksum compatibility, transport deadlines and connection pooling. Configure `maxAttempts: 1` for this non-replayable single-use body; retry-safe reconstruction is not implemented. SDK failures must settle normally on abort, as the default Node HTTP handler does; an injected handler that ignores its abort signal is outside this contract. B2 compatibility must be qualified against a disposable real B2 bucket; synthetic SDK transport tests do not establish it. Never enable public bucket access as a shortcut.
 
@@ -48,7 +48,7 @@ Use the checkout's pinned tools and workspace packages:
 ```sh
 mise run //server:install
 mise run //:plugins
-mise run //server:test --run src/repositories/local-object-store.repository.spec.ts src/repositories/s3-object-store.repository.spec.ts
+mise run //server:test --run src/repositories/local-object-store.repository.spec.ts src/repositories/s3-object-store.repository.spec.ts src/repositories/s3-multipart.repository.spec.ts
 mise run //server:test --run
 mise run //server:check
 mise run //server:lint
