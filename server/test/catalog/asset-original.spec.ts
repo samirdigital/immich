@@ -12,6 +12,7 @@ import { DB, ImmichDatabase } from 'src/schema/index.js';
 import { up as catalogUp } from 'src/schema/migrations/1793500000000-AddObjectCatalog.js';
 import { up as multipartUp } from 'src/schema/migrations/1793500001000-AddS3MultipartJournal.js';
 import { down, up } from 'src/schema/migrations/1793500002000-AddAssetOriginal.js';
+import { up as sourceUp } from 'src/schema/migrations/1793500003000-AddUploadSourceReceipt.js';
 import { ObjectCatalogService } from 'src/services/object-catalog.service.js';
 
 const socket = process.env.CATALOG_TEST_SOCKET;
@@ -38,6 +39,7 @@ beforeAll(async () => {
   await catalogUp(db);
   await multipartUp(db);
   await up(db);
+  await sourceUp(db);
   originals = new AssetOriginalRepository(db);
   catalog = new ObjectCatalogRepository(db);
 });

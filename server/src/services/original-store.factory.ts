@@ -1,10 +1,15 @@
 import { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
+import { Kysely } from 'kysely';
+import { KYSELY_MODULE_CONNECTION_TOKEN } from 'nestjs-kysely';
 import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { AssetOriginalRepository } from 'src/repositories/asset-original.repository.js';
 import { S3ObjectStoreRepository } from 'src/repositories/s3-object-store.repository.js';
+import { DB } from 'src/schema/index.js';
 import { OriginalReader, OriginalStoreRegistry } from 'src/services/original-reader.js';
+import { UploadPublicationHttpAdapter } from 'src/services/upload-publication-http.adapter.js';
+import { UploadStoreRegistry, createManagedUpload } from 'src/services/upload-publication-http.factory.js';
 
 export const ORIGINAL_STORES = Symbol('OriginalStores');
 
@@ -23,7 +28,7 @@ export const createOriginalStores = async (
   env: NodeJS.ProcessEnv,
   repository: AssetOriginalRepository,
   clientFactory: (options: S3ClientConfig) => S3Client = (options) => new S3Client(options),
-): Promise<OriginalStoreRegistry & { privateProcessingRoot?: string; onModuleDestroy: () => void }> => {
+): Promise<UploadStoreRegistry & { privateProcessingRoot?: string; onModuleDestroy: () => void }> => {
   if (env.IMMICH_OBJECT_READ_ENABLED === undefined || env.IMMICH_OBJECT_READ_ENABLED === 'false') {
     return { get: (): undefined => undefined, onModuleDestroy: () => {} };
   }
@@ -69,6 +74,13 @@ export const createOriginalStores = async (
     const store = new S3ObjectStoreRepository(client, { bucket: config.IMMICH_OBJECT_BUCKET });
     let closed = false;
     return Object.freeze({
+      uploadBinding: Object.freeze({
+        provider: 's3' as const,
+        storeId,
+        endpoint: endpoint.origin,
+        bucket: config.IMMICH_OBJECT_BUCKET,
+        store,
+      }),
       privateProcessingRoot: root,
       readTimeoutMs: 30_000,
       get: (id: string) => (!closed && id === storeId ? store : undefined),
@@ -87,6 +99,11 @@ export const createOriginalStores = async (
 };
 
 export const originalProviders = [
+  {
+    provide: UploadPublicationHttpAdapter,
+    inject: [{ token: KYSELY_MODULE_CONNECTION_TOKEN(), optional: true }, ORIGINAL_STORES],
+    useFactory: (db: Kysely<DB>, registry: UploadStoreRegistry) => createManagedUpload(process.env, db, registry),
+  },
   AssetOriginalRepository,
   {
     provide: ORIGINAL_STORES,

@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Next,
@@ -79,9 +80,12 @@ export class AssetMediaController {
     @UploadedFiles(new ParseFilePipe({ validators: [new FileNotEmptyValidator(['assetData'])] })) files: UploadFiles,
     @Body() dto: AssetMediaCreateDto,
     @Res({ passthrough: true }) res: Response,
+    @Headers('x-immich-upload-idempotency-key') idempotencyKey?: string,
   ): Promise<AssetMediaResponseDto> {
     const { file, sidecarFile } = getFiles(files);
-    const responseDto = await this.service.uploadAsset(auth, dto, file, sidecarFile);
+    const responseDto = await (idempotencyKey === undefined
+      ? this.service.uploadAsset(auth, dto, file, sidecarFile)
+      : this.service.uploadAsset(auth, dto, file, sidecarFile, idempotencyKey));
 
     if (responseDto.status === AssetMediaStatus.DUPLICATE) {
       res.status(HttpStatus.OK);

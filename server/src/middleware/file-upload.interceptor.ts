@@ -15,11 +15,20 @@ import { AuthRequest } from 'src/middleware/auth.guard.js';
 import { LoggingRepository } from 'src/repositories/logging.repository.js';
 import { StorageRepository } from 'src/repositories/storage.repository.js';
 import { AssetMediaService } from 'src/services/asset-media.service.js';
+import { transferUploadReceipt } from 'src/services/upload-publication-http.adapter.js';
 import { asUploadRequest, mapToUploadFile } from 'src/utils/asset.util.js';
 
 export function getFile(files: UploadFiles, property: 'assetData' | 'sidecarData') {
   const file = files[property]?.[0];
-  return file ? mapToUploadFile(file) : file;
+  if (!file) {
+    return file;
+  }
+  const mapped = mapToUploadFile(file);
+  if (file.sourceReceiptId !== undefined) {
+    mapped.sourceReceiptId = file.sourceReceiptId;
+  }
+  transferUploadReceipt(file, mapped);
+  return mapped;
 }
 
 export function getFiles(files: UploadFiles) {
@@ -55,7 +64,9 @@ export class FileUploadInterceptor implements NestInterceptor {
       fileFilter: this.fileFilter.bind(this),
       storage: {
         _handleFile: this.handleFile.bind(this),
-        _removeFile: this.removeFile.bind(this),
+        _removeFile: (request, file, callback) => {
+          void this.removeFile(request, file, callback).catch(callback);
+        },
       },
     });
 
@@ -105,6 +116,17 @@ export class FileUploadInterceptor implements NestInterceptor {
     });
 
     try {
+      if (this.assetService.isManagedUpload(file.fieldname)) {
+        const upload = asUploadRequest(request, file);
+        this.assetService
+          .receiveManagedUpload(upload, file)
+          .then((result) => {
+            Object.assign(file, result);
+            callback(null, result);
+          })
+          .catch(callback);
+        return;
+      }
       (file as ImmichMulterFile).uuid = randomUUID();
 
       const uploadRequest = asUploadRequest(request, file);
@@ -143,7 +165,11 @@ export class FileUploadInterceptor implements NestInterceptor {
     }
   }
 
-  private removeFile(_request: AuthRequest, file: Express.Multer.File, callback: (error: Error | null) => void) {
+  private async removeFile(request: AuthRequest, file: Express.Multer.File, callback: (error: Error | null) => void) {
+    if (await this.assetService.retainManagedUpload(file, request.user?.user.id)) {
+      callback(null);
+      return;
+    }
     this.storageRepository
       .unlink(file.path)
       .then(() => callback(null))

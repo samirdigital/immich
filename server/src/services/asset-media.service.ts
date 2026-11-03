@@ -4,6 +4,7 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import sanitize from 'sanitize-filename';
 import type { UploadFile, UploadRequest } from 'src/types.js';
@@ -37,6 +38,7 @@ import {
 import { AuthRequest } from 'src/middleware/auth.guard.js';
 import { BaseService } from 'src/services/base.service.js';
 import { OriginalReader, OriginalResponse } from 'src/services/original-reader.js';
+import { UploadPublicationHttpAdapter } from 'src/services/upload-publication-http.adapter.js';
 import { requireUploadAccess } from 'src/utils/access.js';
 import { asUploadRequest, onBeforeLink } from 'src/utils/asset.util.js';
 import { isAssetChecksumConstraint } from 'src/utils/database.js';
@@ -52,6 +54,27 @@ export interface AssetMediaRedirectResponse {
 export class AssetMediaService extends BaseService {
   @Inject(OriginalReader)
   private originalReader!: OriginalReader;
+
+  @Optional()
+  @Inject(UploadPublicationHttpAdapter)
+  private managedUpload?: UploadPublicationHttpAdapter;
+
+  isManagedUpload(fieldName: string = UploadFieldName.ASSET_DATA) {
+    return (
+      !!this.managedUpload &&
+      [UploadFieldName.ASSET_DATA, UploadFieldName.SIDECAR_DATA].includes(fieldName as UploadFieldName)
+    );
+  }
+
+  receiveManagedUpload(upload: UploadRequest, file: Express.Multer.File) {
+    const auth = requireUploadAccess(upload.auth);
+    this.canUploadFile(upload);
+    return this.managedUpload!.receive(auth, file, upload.body.filename || upload.file.originalName);
+  }
+
+  retainManagedUpload(file: object, ownerId?: string) {
+    return this.managedUpload?.retain(file, ownerId) ?? Promise.resolve(false);
+  }
 
   async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
     if (!checksum) {
@@ -69,7 +92,10 @@ export class AssetMediaService extends BaseService {
   canUploadFile({ auth, fieldName, file, body }: UploadRequest): true {
     requireUploadAccess(auth);
 
-    const filename = body.filename || file.originalName;
+    const filename =
+      this.isManagedUpload(fieldName) && fieldName === UploadFieldName.SIDECAR_DATA
+        ? file.originalName
+        : body.filename || file.originalName;
 
     switch (fieldName) {
       case UploadFieldName.ASSET_DATA: {
@@ -125,6 +151,9 @@ export class AssetMediaService extends BaseService {
   }
 
   async onUploadError(request: AuthRequest, file: Express.Multer.File) {
+    if (await this.retainManagedUpload(file, request.user?.user.id)) {
+      return;
+    }
     const uploadFilename = this.getUploadFilename(asUploadRequest(request, file));
     const uploadFolder = this.getUploadFolder(asUploadRequest(request, file));
     const uploadPath = `${uploadFolder}/${uploadFilename}`;
@@ -137,7 +166,11 @@ export class AssetMediaService extends BaseService {
     dto: AssetMediaCreateDto,
     file: UploadFile,
     sidecarFile?: UploadFile,
+    idempotencyKey?: string,
   ): Promise<AssetMediaResponseDto> {
+    if (this.managedUpload) {
+      return this.managedUpload.upload(auth, dto, file, sidecarFile, idempotencyKey);
+    }
     let asset: Asset | undefined;
     try {
       await this.requireAccess({

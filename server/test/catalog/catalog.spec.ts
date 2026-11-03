@@ -35,6 +35,7 @@ import { S3ObjectStoreRepository } from 'src/repositories/s3-object-store.reposi
 import { DB, ImmichDatabase } from 'src/schema/index.js';
 import { down, up } from 'src/schema/migrations/1793500000000-AddObjectCatalog.js';
 import { down as downMultipart, up as upMultipart } from 'src/schema/migrations/1793500001000-AddS3MultipartJournal.js';
+import { down as sourceDown, up as sourceUp } from 'src/schema/migrations/1793500003000-AddUploadSourceReceipt.js';
 import { ObjectCatalogService } from 'src/services/object-catalog.service.js';
 
 const socket = process.env.CATALOG_TEST_SOCKET;
@@ -55,8 +56,10 @@ let source: string;
 beforeAll(async () => {
   await admin.unsafe(`CREATE DATABASE "${database}"`);
   db = new Kysely<DB>({ dialect: new PostgresJSDialect({ postgres: postgres({ ...options, database }) }) });
+  await sql`CREATE TABLE "user" (id uuid PRIMARY KEY)`.execute(db);
   await up(db);
   await upMultipart(db);
+  await sourceUp(db);
 });
 afterAll(async () => {
   await db?.destroy();
@@ -978,15 +981,17 @@ it.each(['deleting', 'unlinked'])(
   },
 );
 
-it('new migration alone can revert and reapply without extensions or the upstream chain', async () => {
+it('catalog migrations can revert and reapply while retaining the minimal owner fixture', async () => {
+  await sourceDown(db);
   await downMultipart(db);
   await down(db);
   const result = await sql<{
     name: string;
   }>`SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'`.execute(db);
-  expect(result.rows).toEqual([]);
+  expect(result.rows).toEqual([{ name: 'user' }]);
   await up(db);
   await upMultipart(db);
+  await sourceUp(db);
 });
 
 async function s3Loopback(stageId: string, partDelayMs = 0, options: { partSize?: number; expectedKey?: string } = {}) {

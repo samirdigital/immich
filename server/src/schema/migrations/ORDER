@@ -102,3 +102,6 @@
 1793500000000-AddObjectCatalog
 1793500001000-AddS3MultipartJournal
 1793500002000-AddAssetOriginal
+1793500003000-AddUploadSourceReceipt
+1793500004000-AddUploadPublication
+1793500005000-AddPublicationConsumers

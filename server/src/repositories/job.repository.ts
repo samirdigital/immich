@@ -255,6 +255,22 @@ export class JobRepository {
   }
 
   private getJobOptions(item: JobItem): JobsOptions | null {
+    if (item.name === JobName.AssetExtractMetadata && item.data.publication) {
+      return {
+        jobId: `publication-${item.data.publication.effectId}`,
+        removeOnComplete: true,
+        removeOnFail: true,
+        attempts: 1,
+      };
+    }
+    if (item.name === JobName.WorkflowAssetTrigger && item.data.publicationRunId) {
+      return {
+        jobId: `publication-run-${item.data.publicationRunId}`,
+        removeOnComplete: true,
+        removeOnFail: true,
+        attempts: 1,
+      };
+    }
     switch (item.name) {
       case JobName.NotifyAlbumUpdate: {
         return {

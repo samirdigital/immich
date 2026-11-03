@@ -6,7 +6,7 @@ import {
   WorkflowResponse,
   WorkflowTrigger,
 } from '@immich/plugin-sdk';
-import { HttpException, UnauthorizedException } from '@nestjs/common';
+import { HttpException, Inject, UnauthorizedException } from '@nestjs/common';
 import { join } from 'node:path';
 import type { ArgOf } from 'src/repositories/event.repository.js';
 import type { JobOf } from 'src/types.js';
@@ -27,6 +27,7 @@ import {
   WorkflowResult,
   WorkflowType,
 } from 'src/enum.js';
+import { PublicationConsumerRepository } from 'src/repositories/publication-consumer.repository.js';
 import { AlbumService } from 'src/services/album.service.js';
 import { AssetService } from 'src/services/asset.service.js';
 import { BaseService } from 'src/services/base.service.js';
@@ -50,6 +51,9 @@ type HostContext = {
 };
 
 export class WorkflowExecutionService extends BaseService {
+  @Inject(PublicationConsumerRepository)
+  publicationConsumers!: PublicationConsumerRepository;
+
   private jwtSecret!: string;
 
   @OnEvent({ name: 'AppBootstrap', priority: BootstrapEventPriority.PluginSync, workers: [ImmichWorker.Microservices] })
@@ -305,12 +309,18 @@ export class WorkflowExecutionService extends BaseService {
   }
 
   @OnEvent({ name: 'AssetCreate' })
-  onAssetCreate({ asset: { ownerId: userId, id: assetId } }: ArgOf<'AssetCreate'>) {
+  onAssetCreate({ asset: { ownerId: userId, id: assetId }, publication }: ArgOf<'AssetCreate'>) {
+    if (publication) {
+      return;
+    }
     return this.onAssetTrigger({ userId, assetId, trigger: WorkflowTrigger.AssetCreate });
   }
 
   @OnEvent({ name: 'AssetMetadataExtracted' })
-  onAssetMetadataExtracted({ userId, assetId, source }: ArgOf<'AssetMetadataExtracted'>) {
+  onAssetMetadataExtracted({ userId, assetId, source, publication }: ArgOf<'AssetMetadataExtracted'>) {
+    if (publication) {
+      return;
+    }
     // prevent loops
     // TODO loop detection in job service directly
     if (source === 'sidecar-write') {
@@ -336,64 +346,85 @@ export class WorkflowExecutionService extends BaseService {
   }
 
   @OnJob({ name: JobName.WorkflowAssetTrigger, queue: QueueName.Workflow })
-  handleAssetTrigger({ workflowId, assetId }: JobOf<JobName.WorkflowAssetTrigger>) {
-    return this.execute(workflowId, (type) => {
-      const assetService = BaseService.create(AssetService, this);
-
-      switch (type) {
-        case WorkflowType.AssetV1: {
-          return {
-            read: async () => {
-              const asset = await this.workflowRepository.getForAssetV1(assetId);
-              return {
-                data: { asset } as any,
-                authUserId: asset.ownerId,
-                entityId: asset.id,
-              };
-            },
-            write: async (auth, changes) => {
-              const asset = changes.asset;
-              if (!asset) {
-                return;
-              }
-
-              await assetService.update(auth, assetId, {
-                isFavorite: asset.isFavorite,
-                visibility: asset.visibility,
-                dateTimeOriginal: asset.exifInfo?.dateTimeOriginal ?? undefined,
-                // TODO allow setting to null
-                longitude: asset.exifInfo?.longitude ?? undefined,
-                // TODO allow setting to null
-                latitude: asset.exifInfo?.latitude ?? undefined,
-                // TODO allow setting to null
-                description: asset.exifInfo?.description ?? undefined,
-                rating: asset.exifInfo?.rating,
-
-                // TODO add to update dto
-                // make: asset.exifInfo?.make,
-                // model: asset.exifInfo?.model,
-                // city: asset.exifInfo?.city,
-                // state: asset.exifInfo?.state,
-                // country: asset.exifInfo?.country,
-                // lensModel: asset.exifInfo?.lensModel,
-                // fNumber: asset.exifInfo?.fNumber,
-                // fps: asset.exifInfo?.fps,
-                // iso: asset.exifInfo?.iso,
-              });
-            },
-          } satisfies ExecuteOptions<typeof type>;
-        }
+  handleAssetTrigger(data: JobOf<JobName.WorkflowAssetTrigger>) {
+    if (data.publication || data.publicationRunId) {
+      if (!data.publication || !data.publicationRunId) {
+        throw new Error('Incomplete publication workflow identity');
       }
-    });
+      return this.publicationConsumers.consumeRun(
+        data.publicationRunId,
+        data.publication,
+        data.workflowId,
+        data.assetId,
+        (runId) => this.executeAssetTrigger(data, runId),
+      );
+    }
+    return this.executeAssetTrigger(data);
+  }
+
+  private executeAssetTrigger({ workflowId, assetId }: JobOf<JobName.WorkflowAssetTrigger>, runId?: string) {
+    return this.execute(
+      workflowId,
+      (type) => {
+        const assetService = BaseService.create(AssetService, this);
+
+        switch (type) {
+          case WorkflowType.AssetV1: {
+            return {
+              read: async () => {
+                const asset = await this.workflowRepository.getForAssetV1(assetId);
+                return {
+                  data: { asset } as any,
+                  authUserId: asset.ownerId,
+                  entityId: asset.id,
+                };
+              },
+              write: async (auth, changes) => {
+                const asset = changes.asset;
+                if (!asset) {
+                  return;
+                }
+
+                await assetService.update(auth, assetId, {
+                  isFavorite: asset.isFavorite,
+                  visibility: asset.visibility,
+                  dateTimeOriginal: asset.exifInfo?.dateTimeOriginal ?? undefined,
+                  // TODO allow setting to null
+                  longitude: asset.exifInfo?.longitude ?? undefined,
+                  // TODO allow setting to null
+                  latitude: asset.exifInfo?.latitude ?? undefined,
+                  // TODO allow setting to null
+                  description: asset.exifInfo?.description ?? undefined,
+                  rating: asset.exifInfo?.rating,
+
+                  // TODO add to update dto
+                  // make: asset.exifInfo?.make,
+                  // model: asset.exifInfo?.model,
+                  // city: asset.exifInfo?.city,
+                  // state: asset.exifInfo?.state,
+                  // country: asset.exifInfo?.country,
+                  // lensModel: asset.exifInfo?.lensModel,
+                  // fNumber: asset.exifInfo?.fNumber,
+                  // fps: asset.exifInfo?.fps,
+                  // iso: asset.exifInfo?.iso,
+                });
+              },
+            } satisfies ExecuteOptions<typeof type>;
+          }
+        }
+      },
+      runId,
+    );
   }
 
   private async execute<T extends WorkflowType>(
     workflowId: string,
     getHandler: (type: T) => ExecuteOptions<T> | undefined,
+    persistedRunId?: string,
   ) {
     const workflow = await this.workflowRepository.getForWorkflowRun(workflowId);
     if (!workflow) {
-      return;
+      return persistedRunId ? JobStatus.Skipped : undefined;
     }
 
     // TODO infer from steps
@@ -419,7 +450,7 @@ export class WorkflowExecutionService extends BaseService {
     const { read, write } = handler;
     const readResult = await read(type);
     let data = readResult.data;
-    const runId = crypto.randomUUID();
+    const runId = persistedRunId ?? crypto.randomUUID();
 
     for (const step of workflow.steps) {
       try {
@@ -484,7 +515,7 @@ export class WorkflowExecutionService extends BaseService {
           }
 
           this.logger.debug(`Workflow ${workflowId} run ${runId} stopped on step ${step.id}`);
-          return;
+          return persistedRunId ? WorkflowResult.Halted : undefined;
         }
       } catch (error) {
         this.logger.error(`Error executing workflow ${workflowId} run ${runId}:`, error);
@@ -513,5 +544,6 @@ export class WorkflowExecutionService extends BaseService {
     }
 
     this.logger.debug(`Workflow ${workflowId} run ${runId} executed successfully`);
+    return persistedRunId ? WorkflowResult.Completed : undefined;
   }
 }

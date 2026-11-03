@@ -43,7 +43,12 @@ export class AssetOriginalRepository {
         .select('id')
         .where('stageId', '=', stage.id)
         .executeTakeFirst();
-      if (stage.state !== 'ready' || stage.released || intent) {
+      const owned = await db
+        .selectFrom('owned_stage_receipt')
+        .select('stageId')
+        .where('stageId', '=', stage.id)
+        .executeTakeFirst();
+      if (stage.state !== 'ready' || stage.released || intent || owned) {
         throw new Error('Stage is not a fresh owned claim');
       }
       return db

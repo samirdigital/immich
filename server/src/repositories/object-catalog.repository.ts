@@ -34,6 +34,10 @@ export class ObjectCatalogRepository {
     this.objectKeyPrefix = prefix;
   }
 
+  withDatabase(db: Kysely<DB>) {
+    return new ObjectCatalogRepository(db, { objectKeyPrefix: this.objectKeyPrefix });
+  }
+
   listMultipart(stageId: string) {
     return this.db
       .selectFrom('s3_multipart_journal')
@@ -263,6 +267,85 @@ export class ObjectCatalogRepository {
     });
   }
 
+  async reserveOwnedStage(sourceId: string, ownerId: string, root: string, publicationId?: string) {
+    return this.db.transaction().execute(async (db) => {
+      const publication = publicationId
+        ? await db
+            .selectFrom('upload_publication')
+            .selectAll()
+            .where('id', '=', publicationId)
+            .where('sourceId', '=', sourceId)
+            .where('ownerId', '=', ownerId)
+            .forUpdate()
+            .executeTakeFirstOrThrow()
+        : undefined;
+      const associate = async (stageId: string) => {
+        if (!publication) {
+          return;
+        }
+
+        if (publication.stageId && publication.stageId !== stageId) {
+          throw new Error('Publication stage mismatch');
+        }
+        await db.updateTable('upload_publication').set({ stageId }).where('id', '=', publication.id).execute();
+      };
+      const source = await db
+        .selectFrom('source_receipt')
+        .selectAll()
+        .where('id', '=', sourceId)
+        .where('ownerId', '=', ownerId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      if (
+        source.state !== 'sealed' ||
+        source.role !== 'original' ||
+        !source.identity ||
+        !source.sha256 ||
+        source.size === null
+      ) {
+        throw new Error('Source is not a sealed owned original');
+      }
+      const existing = await db
+        .selectFrom('owned_stage_receipt')
+        .selectAll()
+        .where('sourceId', '=', source.id)
+        .where('ownerId', '=', ownerId)
+        .executeTakeFirst();
+      if (existing) {
+        const stage = await db
+          .selectFrom('staged_object')
+          .selectAll()
+          .where('id', '=', existing.stageId)
+          .forUpdate()
+          .executeTakeFirstOrThrow();
+        if (stage.root !== root) {
+          throw new Error('Reserved stage root mismatch');
+        }
+        await associate(stage.id);
+        return { source, stage, created: false };
+      }
+      const stage = await db
+        .insertInto('staged_object')
+        .values({ id: randomUUID(), root, state: 'creating' })
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      await db
+        .insertInto('owned_stage_receipt')
+        .values({
+          stageId: stage.id,
+          sourceId: source.id,
+          ownerId,
+          sourceState: 'sealed',
+          hash: source.sha256,
+          size: source.size,
+          sourceIdentity: source.identity,
+        })
+        .execute();
+      await associate(stage.id);
+      return { source, stage, created: true };
+    });
+  }
+
   createStage(id: string, root: string) {
     return this.db
       .insertInto('staged_object')
@@ -330,7 +413,12 @@ export class ObjectCatalogRepository {
         .where('id', '=', id)
         .forUpdate()
         .executeTakeFirstOrThrow();
-      if (stage.state !== 'ready' || !stage.released || stage.pins.length > 0) {
+      const owned = await db
+        .selectFrom('owned_stage_receipt')
+        .select('stageId')
+        .where('stageId', '=', id)
+        .executeTakeFirst();
+      if (owned || stage.state !== 'ready' || !stage.released || stage.pins.length > 0) {
         return;
       }
       const intents = await db.selectFrom('object_upload_intent').selectAll().where('stageId', '=', id).execute();
@@ -421,6 +509,100 @@ export class ObjectCatalogRepository {
     return this.db.selectFrom('object_upload_intent').selectAll().where('stageId', '=', stageId).execute();
   }
 
+  async prepareOwned(publicationId: string, ownerId: string, storeId: string) {
+    return this.db.transaction().execute(async (db) => {
+      const publication = await db
+        .selectFrom('upload_publication')
+        .selectAll()
+        .where('id', '=', publicationId)
+        .where('ownerId', '=', ownerId)
+        .where('storeId', '=', storeId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      if (publication.result || !publication.stageId) {
+        throw new Error('Publication unavailable');
+      }
+      if (publication.intentId) {
+        return db
+          .selectFrom('object_upload_intent')
+          .selectAll()
+          .where('id', '=', publication.intentId)
+          .where('stageId', '=', publication.stageId)
+          .where('provider', '=', 's3')
+          .where('storeId', '=', storeId)
+          .executeTakeFirstOrThrow();
+      }
+      const stage = await db
+        .selectFrom('staged_object')
+        .selectAll()
+        .where('id', '=', publication.stageId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      const owned = await db
+        .selectFrom('owned_stage_receipt')
+        .selectAll()
+        .where('stageId', '=', stage.id)
+        .where('sourceId', '=', publication.sourceId)
+        .where('ownerId', '=', ownerId)
+        .executeTakeFirstOrThrow();
+      if (stage.state !== 'ready' || stage.released || stage.hash !== owned.hash || stage.size !== owned.size) {
+        throw new Error('Owned stage unavailable');
+      }
+      const existing = await db
+        .selectFrom('object_upload_intent')
+        .select('id')
+        .where('stageId', '=', stage.id)
+        .executeTakeFirst();
+      if (existing) {
+        throw new Error('Owned stage already has an intent');
+      }
+      const id = randomUUID();
+      const intent = await db
+        .insertInto('object_upload_intent')
+        .values({
+          id,
+          stageId: stage.id,
+          provider: 's3',
+          storeId,
+          key: `${this.objectKeyPrefix}/${stage.id}/${id}`,
+          state: 'prepared',
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      await db
+        .updateTable('upload_publication')
+        .set({ intentId: intent.id, state: 'prepared' })
+        .where('id', '=', publication.id)
+        .execute();
+      return intent;
+    });
+  }
+
+  async authorizeOwnedSend(intentId: string, publicationId?: string) {
+    const intent = await this.getIntent(intentId);
+    const owned = await this.db
+      .selectFrom('owned_stage_receipt')
+      .select('stageId')
+      .where('stageId', '=', intent.stageId)
+      .executeTakeFirst();
+    if (owned) {
+      if (!publicationId) {
+        throw new Error('Owned intent requires publication permit');
+      }
+      await this.db
+        .selectFrom('upload_publication')
+        .select('id')
+        .where('id', '=', publicationId)
+        .where('stageId', '=', intent.stageId)
+        .where('intentId', '=', intentId)
+        .where('storeId', '=', intent.storeId)
+        .where('result', 'is', null)
+        .executeTakeFirstOrThrow();
+    } else if (publicationId) {
+      throw new Error('Unexpected publication permit');
+    }
+  }
+
   async prepare(stageId: string, provider: 'local' | 's3', storeId: string) {
     return this.db.transaction().execute(async (db) => {
       const stage = await db
@@ -429,6 +611,14 @@ export class ObjectCatalogRepository {
         .where('id', '=', stageId)
         .forUpdate()
         .executeTakeFirstOrThrow();
+      const owned = await db
+        .selectFrom('owned_stage_receipt')
+        .select('stageId')
+        .where('stageId', '=', stage.id)
+        .executeTakeFirst();
+      if (owned) {
+        throw new Error('Receipt-owned stage requires an owned intent');
+      }
       if (stage.state !== 'ready' || stage.released) {
         throw new Error('Stage is not available');
       }
@@ -477,10 +667,36 @@ export class ObjectCatalogRepository {
     });
   }
 
-  startSending(id: string, leaseMs: number) {
+  async startSending(id: string, leaseMs: number, publicationId?: string) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 3_600_000) {
       throw new Error('Invalid lease duration');
     }
+    await this.authorizeOwnedSend(id, publicationId);
+    if (publicationId) {
+      return this.db.transaction().execute(async (db) => {
+        const publication = await db
+          .selectFrom('upload_publication')
+          .selectAll()
+          .where('id', '=', publicationId)
+          .where('intentId', '=', id)
+          .where('result', 'is', null)
+          .forUpdate()
+          .executeTakeFirstOrThrow();
+        const claim = await new ObjectCatalogRepository(db).startSendingRaw(id, leaseMs);
+        if (claim) {
+          await db
+            .updateTable('upload_publication')
+            .set({ exactAttempt: claim.token })
+            .where('id', '=', publication.id)
+            .execute();
+        }
+        return claim;
+      });
+    }
+    return this.startSendingRaw(id, leaseMs);
+  }
+
+  private startSendingRaw(id: string, leaseMs: number) {
     return this.db
       .updateTable('object_upload_intent')
       .set({

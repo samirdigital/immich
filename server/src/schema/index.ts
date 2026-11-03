@@ -71,6 +71,7 @@ import { NotificationTable } from 'src/schema/tables/notification.table.js';
 import { ObjectUploadIntentTable } from 'src/schema/tables/object-upload-intent.table.js';
 import { ObjectVersionTable } from 'src/schema/tables/object-version.table.js';
 import { OcrSearchTable } from 'src/schema/tables/ocr-search.table.js';
+import { OwnedStageReceiptTable } from 'src/schema/tables/owned-stage-receipt.table.js';
 import { PartnerAuditTable } from 'src/schema/tables/partner-audit.table.js';
 import { PartnerTable } from 'src/schema/tables/partner.table.js';
 import { PersonAuditTable } from 'src/schema/tables/person-audit.table.js';
@@ -80,11 +81,18 @@ import { PersonUserTable } from 'src/schema/tables/person-user.table.js';
 import { PersonTable } from 'src/schema/tables/person.table.js';
 import { PluginMethodTable } from 'src/schema/tables/plugin-method.table.js';
 import { PluginTable } from 'src/schema/tables/plugin.table.js';
+import {
+  PublicationConsumerTable,
+  PublicationWorkflowRunTable,
+  publication_consumer_identity,
+  publication_run_identity,
+} from 'src/schema/tables/publication-consumer.table.js';
 import { S3MultipartJournalTable } from 'src/schema/tables/s3-multipart-journal.table.js';
 import { SessionTable } from 'src/schema/tables/session.table.js';
 import { SharedLinkAssetTable } from 'src/schema/tables/shared-link-asset.table.js';
 import { SharedLinkTable } from 'src/schema/tables/shared-link.table.js';
 import { SmartSearchTable } from 'src/schema/tables/smart-search.table.js';
+import { SourceReceiptTable } from 'src/schema/tables/source-receipt.table.js';
 import { StackAuditTable } from 'src/schema/tables/stack-audit.table.js';
 import { StackTable } from 'src/schema/tables/stack.table.js';
 import { StagedObjectTable } from 'src/schema/tables/staged-object.table.js';
@@ -93,6 +101,7 @@ import { SystemMetadataTable } from 'src/schema/tables/system-metadata.table.js'
 import { TagAssetTable } from 'src/schema/tables/tag-asset.table.js';
 import { TagClosureTable } from 'src/schema/tables/tag-closure.table.js';
 import { TagTable } from 'src/schema/tables/tag.table.js';
+import { UploadPublicationOutboxTable, UploadPublicationTable } from 'src/schema/tables/upload-publication.table.js';
 import { UserAuditTable } from 'src/schema/tables/user-audit.table.js';
 import { UserMetadataAuditTable } from 'src/schema/tables/user-metadata-audit.table.js';
 import { UserMetadataTable } from 'src/schema/tables/user-metadata.table.js';
@@ -111,6 +120,12 @@ import { WorkflowTable } from 'src/schema/tables/workflow.table.js';
 @Database({ name: 'immich' })
 export class ImmichDatabase {
   tables = [
+    PublicationConsumerTable,
+    PublicationWorkflowRunTable,
+    UploadPublicationTable,
+    UploadPublicationOutboxTable,
+    SourceReceiptTable,
+    OwnedStageReceiptTable,
     OriginalStoreIdentityTable,
     AssetOriginalClaimTable,
     AssetOriginalTable,
@@ -186,6 +201,8 @@ export class ImmichDatabase {
   ];
 
   functions = [
+    publication_consumer_identity,
+    publication_run_identity,
     immich_uuid_v7,
     updated_at,
     f_concat_ws,
@@ -224,6 +241,12 @@ export interface Migrations {
 }
 
 export interface DB {
+  publication_consumer: PublicationConsumerTable;
+  publication_workflow_run: PublicationWorkflowRunTable;
+  upload_publication: UploadPublicationTable;
+  upload_publication_outbox: UploadPublicationOutboxTable;
+  source_receipt: SourceReceiptTable;
+  owned_stage_receipt: OwnedStageReceiptTable;
   original_store_identity: OriginalStoreIdentityTable;
   asset_original_claim: AssetOriginalClaimTable;
   asset_original: AssetOriginalTable;

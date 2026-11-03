@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { ContainerDirectoryItem, ExifDateTime, Tags } from 'exiftool-vendored';
 import { Insertable } from 'kysely';
 import { isUndefined, omitBy, pick } from 'lodash-es';
@@ -26,6 +26,7 @@ import {
 } from 'src/enum.js';
 import { ReverseGeocodeResult } from 'src/repositories/map.repository.js';
 import { ImmichTags } from 'src/repositories/metadata.repository.js';
+import { PublicationConsumerRepository } from 'src/repositories/publication-consumer.repository.js';
 import { AssetExifTable } from 'src/schema/tables/asset-exif.table.js';
 import { AssetFaceTable } from 'src/schema/tables/asset-face.table.js';
 import { BaseService } from 'src/services/base.service.js';
@@ -136,6 +137,9 @@ type Dates = {
 
 @Injectable()
 export class MetadataService extends BaseService {
+  @Inject(PublicationConsumerRepository)
+  publicationConsumers!: PublicationConsumerRepository;
+
   @OnEvent({ name: 'AppBootstrap', workers: [ImmichWorker.Microservices] })
   async onBootstrap() {
     this.logger.log('Bootstrapping metadata service');
@@ -227,13 +231,22 @@ export class MetadataService extends BaseService {
 
   @OnJob({ name: JobName.AssetExtractMetadata, queue: QueueName.MetadataExtraction })
   async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) {
+    if (data.publication) {
+      return this.publicationConsumers.consumeMetadata(data.id, data.publication, () =>
+        this.extractMetadata(data, true),
+      );
+    }
+    return this.extractMetadata(data);
+  }
+
+  private async extractMetadata(data: JobOf<JobName.AssetExtractMetadata>, publication = false) {
     const [{ metadata, reverseGeocoding }, asset] = await Promise.all([
       this.getConfig({ withCache: true }),
       this.assetJobRepository.getForMetadataExtraction(data.id),
     ]);
 
     if (!asset) {
-      return;
+      return publication ? JobStatus.Skipped : undefined;
     }
 
     const [exifResult, stats] = await Promise.all([
@@ -406,6 +419,10 @@ export class MetadataService extends BaseService {
 
     if (exifData.livePhotoCID) {
       await this.linkLivePhotos(asset, exifData);
+    }
+
+    if (publication) {
+      return JobStatus.Success;
     }
 
     await this.assetRepository.upsertJobStatus({ assetId: asset.id, metadataExtractedAt: new Date() });

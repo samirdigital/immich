@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ObjectCatalogRepository } from 'src/repositories/object-catalog.repository.js';
 import { ObjectStore, ObjectWriteResult, closeObjectStreams } from 'src/repositories/object-store.repository.js';
 import { StagedObjectTable } from 'src/schema/tables/staged-object.table.js';
+import { OwnedSource } from 'src/services/owned-source.service.js';
 
 export interface CatalogStoreBinding {
   provider: 'local' | 's3';
@@ -30,6 +31,10 @@ export class ObjectCatalogService {
     private catalog: ObjectCatalogRepository,
     private root: string,
   ) {}
+
+  withCatalog(catalog: ObjectCatalogRepository) {
+    return new ObjectCatalogService(catalog, this.root);
+  }
 
   private async rootStat() {
     if (!path.isAbsolute(this.root) || (await realpath(this.root)) !== this.root) {
@@ -197,7 +202,8 @@ export class ObjectCatalogService {
     return this.sendPrepared(intent.id, binding, leaseMs);
   }
 
-  async sendPrepared(intentId: string, binding: CatalogStoreBinding, leaseMs = 60_000) {
+  async sendPrepared(intentId: string, binding: CatalogStoreBinding, leaseMs = 60_000, publicationId?: string) {
+    await this.catalog.authorizeOwnedSend(intentId, publicationId);
     const intent = await this.catalog.getIntent(intentId);
     const stage = await this.catalog.getStage(intent.stageId);
     if (
@@ -210,7 +216,7 @@ export class ObjectCatalogService {
     ) {
       throw new Error('Prepared intent/store/stage unavailable');
     }
-    const claim = await this.catalog.startSending(intent.id, leaseMs);
+    const claim = await this.catalog.startSending(intent.id, leaseMs, publicationId);
     if (!claim?.token) {
       throw new Error('Claim lost');
     }
@@ -348,10 +354,31 @@ export class ObjectCatalogService {
     return { unknown: names.filter((name) => !known.has(name)), held };
   }
 
+  async stageOwned(sourceId: string, ownerId: string, publicationId?: string) {
+    await this.rootStat();
+    const reservation = await this.catalog.reserveOwnedStage(sourceId, ownerId, this.root, publicationId);
+    if (!reservation.created) {
+      if (reservation.stage.state !== 'ready' || reservation.stage.released) {
+        throw new Error('Owned stage is held or creation is incomplete');
+      }
+      return reservation.stage;
+    }
+    return this.copyStage(
+      reservation.stage.id,
+      path.join(reservation.source.root, reservation.source.name),
+      reservation.source,
+    );
+  }
+
   async stage(source: string) {
-    const root = await this.rootStat();
+    await this.rootStat();
     const id = randomUUID();
     await this.catalog.createStage(id, this.root);
+    return this.copyStage(id, source);
+  }
+
+  private async copyStage(id: string, source: string, expected?: OwnedSource) {
+    const root = await this.rootStat();
     try {
       if (
         (await realpath(source)) !== path.resolve(source) ||
@@ -365,6 +392,19 @@ export class ObjectCatalogService {
         const before = await input.stat({ bigint: true });
         if (!before.isFile() || before.nlink !== 1n) {
           throw new Error('Source must be a regular non-hardlinked file');
+        }
+        if (expected) {
+          const sourceRoot = await lstat(expected.root, { bigint: true });
+          if (
+            !expected.identity ||
+            sourceRoot.dev.toString() !== expected.rootDev ||
+            sourceRoot.ino.toString() !== expected.rootIno ||
+            Object.entries(snapshot(before)).some(
+              ([key, value]) => expected.identity![key as keyof typeof expected.identity] !== value,
+            )
+          ) {
+            throw new Error('Owned source identity mismatch');
+          }
         }
         const output = await open(
           path.join(this.root, id),
@@ -408,10 +448,14 @@ export class ObjectCatalogService {
           if (root.ino !== currentRoot.ino || root.dev !== currentRoot.dev) {
             throw new Error('Staging root replaced');
           }
+          const digest = hash.digest('hex');
+          if (expected && (digest !== expected.sha256 || owned.size.toString() !== expected.size)) {
+            throw new Error('Owned source bytes mismatch');
+          }
           return await this.catalog.sealStage(
             id,
             { ...snapshot(owned), rootDev: root.dev.toString(), rootIno: root.ino.toString() },
-            hash.digest('hex'),
+            digest,
           );
         } finally {
           await output.close();

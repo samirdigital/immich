@@ -7,7 +7,7 @@ import {
   ServiceOutputTypes,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
-import { Kysely } from 'kysely';
+import { Kysely, sql } from 'kysely';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -23,6 +23,7 @@ import { S3ObjectStoreRepository } from 'src/repositories/s3-object-store.reposi
 import { DB } from 'src/schema/index.js';
 import { up } from 'src/schema/migrations/1793500000000-AddObjectCatalog.js';
 import { up as upMultipart } from 'src/schema/migrations/1793500001000-AddS3MultipartJournal.js';
+import { up as sourceUp } from 'src/schema/migrations/1793500003000-AddUploadSourceReceipt.js';
 import { ObjectCatalogService } from 'src/services/object-catalog.service.js';
 import { QualificationConfig, parseQualificationArgs, qualificationPlan } from 'src/utils/b2-qualification.js';
 
@@ -421,6 +422,8 @@ export const runCatalogQualification = async (config: CatalogQualificationConfig
     db = new Kysely<DB>({ dialect: new PostgresJSDialect({ postgres: postgres({ ...options, database }) }) });
     await up(db);
     await upMultipart(db);
+    await sql`CREATE TABLE "user" (id uuid PRIMARY KEY)`.execute(db);
+    await sourceUp(db);
     await guard.persist({ type: 'database-ready', database });
     const root = path.join(config.workspace, 'stage');
     await mkdir(root, { mode: 0o700 });

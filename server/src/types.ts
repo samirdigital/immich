@@ -1,5 +1,6 @@
 import { ShallowDehydrateObject } from 'kysely';
 import { Mocked } from 'vitest';
+import type { PublicationIdentity } from 'src/repositories/publication-consumer.repository.js';
 import { VECTOR_EXTENSIONS } from 'src/constants.js';
 import { AssetFile } from 'src/database.js';
 import { UploadFieldName } from 'src/dtos/asset-media.dto.js';
@@ -377,7 +378,7 @@ export type JobItem =
 
   // Metadata Extraction
   | { name: JobName.AssetExtractMetadataQueueAll; data: IBaseJob }
-  | { name: JobName.AssetExtractMetadata; data: IEntityJob }
+  | { name: JobName.AssetExtractMetadata; data: IEntityJob & { publication?: PublicationIdentity } }
 
   // Notifications
   | { name: JobName.NotificationsCleanup; data?: IBaseJob }
@@ -446,7 +447,10 @@ export type JobItem =
   | { name: JobName.Ocr; data: IEntityJob }
 
   // Workflow
-  | { name: JobName.WorkflowAssetTrigger; data: { workflowId: string; assetId: string } }
+  | {
+      name: JobName.WorkflowAssetTrigger;
+      data: { workflowId: string; assetId: string; publication?: PublicationIdentity; publicationRunId?: string };
+    }
 
   // Integrity
   | { name: JobName.IntegrityUntrackedFilesQueueAll; data?: IIntegrityJob }
@@ -472,12 +476,14 @@ export interface ExtensionVersion {
 }
 
 export interface ImmichFile extends Express.Multer.File {
+  sourceReceiptId?: string;
   uuid: string;
   /** sha1 hash of file */
   checksum: Buffer;
 }
 
 export interface UploadFile {
+  sourceReceiptId?: string;
   uuid: string;
   checksum: Buffer;
   originalPath: string;

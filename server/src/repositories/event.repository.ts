@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ModuleRef, Reflector } from '@nestjs/core';
 import { orderBy } from 'lodash-es';
 import { Socket } from 'socket.io';
+import type { PublicationIdentity } from 'src/repositories/publication-consumer.repository.js';
 import type { JobItem, JobSource, UploadFile } from 'src/types.js';
 import { Asset } from 'src/database.js';
 import { EventConfig } from 'src/decorators.js';
@@ -45,14 +46,14 @@ type EventMap = {
   ClusterGroupRequest: [{ clusterGroupId: string; userId: string; senderName: string }];
 
   // asset events
-  AssetCreate: [{ asset: Pick<Asset, 'id' | 'ownerId'>; file?: UploadFile }];
+  AssetCreate: [{ asset: Pick<Asset, 'id' | 'ownerId'>; file?: UploadFile; publication?: PublicationIdentity }];
   AssetTag: [{ assetId: string; userId: string }];
   AssetUntag: [{ assetId: string }];
   AssetHide: [{ assetId: string; userId: string }];
   AssetShow: [{ assetId: string; userId: string }];
   AssetTrash: [{ assetId: string; userId: string }];
   AssetDelete: [{ assetId: string; userId: string }];
-  AssetMetadataExtracted: [{ assetId: string; userId: string; source?: JobSource }];
+  AssetMetadataExtracted: [{ assetId: string; userId: string; source?: JobSource; publication?: PublicationIdentity }];
 
   // asset bulk events
   AssetTrashAll: [{ assetIds: string[]; userId: string }];
