@@ -1,4 +1,13 @@
-import { Check, Column, CreateDateColumn, type Generated, PrimaryColumn, Table, Timestamp } from '@immich/sql-tools';
+import {
+  Check,
+  Column,
+  CreateDateColumn,
+  type Generated,
+  PrimaryColumn,
+  Table,
+  Timestamp,
+  Unique,
+} from '@immich/sql-tools';
 
 export interface StageIdentity {
   dev: string;
@@ -15,6 +24,7 @@ export interface StageIdentity {
 }
 
 @Table('staged_object')
+@Unique({ name: 'staged_object_publication_uq', columns: ['id', 'hash', 'size'] })
 @Check({
   name: 'staged_object_identity_chk',
   expression: `identity IS NULL OR COALESCE((jsonb_typeof(identity) = 'object' AND (jsonb_typeof(identity->'dev') = 'string' AND identity->>'dev' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'ino') = 'string' AND identity->>'ino' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'size') = 'string' AND identity->>'size' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'mtimeNs') = 'string' AND identity->>'mtimeNs' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'ctimeNs') = 'string' AND identity->>'ctimeNs' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'mode') = 'string' AND identity->>'mode' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'rootDev') = 'string' AND identity->>'rootDev' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'rootIno') = 'string' AND identity->>'rootIno' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'uid') = 'string' AND identity->>'uid' ~ '^[0-9]+$') AND (jsonb_typeof(identity->'gid') = 'string' AND identity->>'gid' ~ '^[0-9]+$') AND identity->>'nlink' = '1' AND identity->>'size' = size::text), false)`,

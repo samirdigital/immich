@@ -117,6 +117,35 @@ describe(S3ObjectStoreRepository.name, () => {
     expect(body.destroyed).toBe(true);
   });
 
+  it.each([
+    [206, { 'content-range': 'bytes 0-5/6' }, undefined],
+    [200, { 'content-range': 'bytes 0-5/6' }, undefined],
+    [200, {}, 7],
+    [206, { 'content-range': 'bytes 1-3/99' }, 6],
+  ])(
+    'rejects full status/content-range and upstream total mismatch (%s %j %s)',
+    async (statusCode, headers, expectedSize) => {
+      const body = Readable.from([Buffer.from('abcdef')]);
+      handle.mockResolvedValue({
+        response: {
+          statusCode,
+          headers: {
+            'content-length': statusCode === 206 && expectedSize === 6 ? '3' : '6',
+            'x-amz-version-id': versioned.versionId,
+            ...headers,
+          },
+          body,
+        },
+      });
+      const options = {
+        ...(expectedSize !== undefined && { expectedSize }),
+        ...(expectedSize === 6 && { range: { start: 1, end: 3 } }),
+      };
+      await expect(store.get(versioned, options)).rejects.toThrow();
+      expect(body.destroyed).toBe(true);
+    },
+  );
+
   it('should delete only the pinned version idempotently', async () => {
     handle.mockResolvedValue({ response: { statusCode: 204, headers: {}, body: Readable.from([]) } });
     await store.delete(versioned);

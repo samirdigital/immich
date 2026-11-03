@@ -19,6 +19,10 @@ export interface VerificationObservation {
 }
 
 @Table('object_version')
+@Unique({
+  name: 'object_version_id_intentId_verification_uq',
+  columns: ['id', 'intentId', 'verification', 'provider', 'storeId', 'key', 'versionId'],
+})
 @ForeignKeyConstraint({
   name: 'object_version_intent_identity_fkey',
   columns: ['intentId', 'provider', 'storeId', 'key'],

@@ -49,6 +49,11 @@ import { AssetMetadataAuditTable } from 'src/schema/tables/asset-metadata-audit.
 import { AssetMetadataTable } from 'src/schema/tables/asset-metadata.table.js';
 import { AssetOcrAuditTable } from 'src/schema/tables/asset-ocr-audit.table.js';
 import { AssetOcrTable } from 'src/schema/tables/asset-ocr.table.js';
+import {
+  AssetOriginalClaimTable,
+  AssetOriginalTable,
+  OriginalStoreIdentityTable,
+} from 'src/schema/tables/asset-original.table.js';
 import { AssetTable } from 'src/schema/tables/asset.table.js';
 import { ClusterGroupRequestTable } from 'src/schema/tables/cluster-group-request.table.js';
 import { ClusterGroupTable } from 'src/schema/tables/cluster-group.table.js';
@@ -106,6 +111,9 @@ import { WorkflowTable } from 'src/schema/tables/workflow.table.js';
 @Database({ name: 'immich' })
 export class ImmichDatabase {
   tables = [
+    OriginalStoreIdentityTable,
+    AssetOriginalClaimTable,
+    AssetOriginalTable,
     StagedObjectTable,
     ObjectUploadIntentTable,
     ObjectVersionTable,
@@ -216,6 +224,9 @@ export interface Migrations {
 }
 
 export interface DB {
+  original_store_identity: OriginalStoreIdentityTable;
+  asset_original_claim: AssetOriginalClaimTable;
+  asset_original: AssetOriginalTable;
   staged_object: StagedObjectTable;
   object_upload_intent: ObjectUploadIntentTable;
   object_version: ObjectVersionTable;

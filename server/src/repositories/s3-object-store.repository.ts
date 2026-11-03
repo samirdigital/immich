@@ -95,7 +95,13 @@ export class S3ObjectStoreRepository implements ObjectStore {
   async get(object: ObjectIdentity, options: ObjectReadOptions = {}) {
     validateObjectIdentity(object);
     validateVersion(object.versionId);
-    validateObjectRange(options.range);
+    validateObjectRange(options.range, options.expectedSize);
+    if (
+      options.expectedSize !== undefined &&
+      (!Number.isSafeInteger(options.expectedSize) || options.expectedSize < 0)
+    ) {
+      throw new RangeError('Invalid expected object total size');
+    }
     const result = await this.client
       .send(
         new GetObjectCommand({
@@ -134,6 +140,7 @@ export class S3ObjectStoreRepository implements ObjectStore {
       ) {
         throw new TypeError('Invalid object response version or length');
       }
+      let totalSize = result.ContentLength!;
       const range = options.range;
       if (range) {
         const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(result.ContentRange ?? '');
@@ -142,20 +149,30 @@ export class S3ObjectStoreRepository implements ObjectStore {
           !match ||
           Number(match[1]) !== range.start ||
           Number(match[2]) !== range.end ||
+          !Number.isSafeInteger(Number(match[3])) ||
           Number(match[3]) <= range.end ||
+          (options.expectedSize !== undefined && Number(match[3]) !== options.expectedSize) ||
           result.ContentLength !== range.end - range.start + 1
         ) {
           throw new RangeError('Object response does not match requested range');
         }
+        totalSize = Number(match[3]);
+      } else if (
+        result.$metadata.httpStatusCode !== 200 ||
+        result.ContentRange !== undefined ||
+        (options.expectedSize !== undefined && totalSize !== options.expectedSize)
+      ) {
+        throw new RangeError('Object response does not match full representation');
       }
       return {
         object: { key: object.key, versionId: result.VersionId },
         stream: options.signal ? addAbortSignal(options.signal, body) : body,
         size: result.ContentLength!,
+        totalSize,
         etag: result.ETag,
       };
     } catch (error) {
-      body.destroy();
+      await closeObjectStreams(body);
       throw error;
     }
   }

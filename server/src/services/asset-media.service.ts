@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import sanitize from 'sanitize-filename';
 import type { UploadFile, UploadRequest } from 'src/types.js';
 import { StorageCore } from 'src/cores/storage.core.js';
@@ -30,6 +36,7 @@ import {
 } from 'src/enum.js';
 import { AuthRequest } from 'src/middleware/auth.guard.js';
 import { BaseService } from 'src/services/base.service.js';
+import { OriginalReader, OriginalResponse } from 'src/services/original-reader.js';
 import { requireUploadAccess } from 'src/utils/access.js';
 import { asUploadRequest, onBeforeLink } from 'src/utils/asset.util.js';
 import { isAssetChecksumConstraint } from 'src/utils/database.js';
@@ -43,6 +50,9 @@ export interface AssetMediaRedirectResponse {
 
 @Injectable()
 export class AssetMediaService extends BaseService {
+  @Inject(OriginalReader)
+  private originalReader!: OriginalReader;
+
   async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
     if (!checksum) {
       return;
@@ -226,7 +236,7 @@ export class AssetMediaService extends BaseService {
     }
   }
 
-  async downloadOriginal(auth: AuthDto, id: string, dto: AssetDownloadOriginalDto): Promise<ImmichFileResponse> {
+  async downloadOriginal(auth: AuthDto, id: string, dto: AssetDownloadOriginalDto): Promise<OriginalResponse> {
     await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: [id] });
 
     if (auth.sharedLink) {
@@ -240,12 +250,15 @@ export class AssetMediaService extends BaseService {
 
     const path = editedPath ?? originalPath!;
 
-    return new ImmichFileResponse({
+    const file = new ImmichFileResponse({
       path,
       fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
       contentType: mimeTypes.lookup(path),
       cacheControl: CacheControl.PrivateWithCache,
     });
+    return editedPath !== undefined && editedPath !== null
+      ? { kind: 'local', file }
+      : this.originalReader.resolve(id, file);
   }
 
   async viewThumbnail(

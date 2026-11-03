@@ -17,6 +17,7 @@ export interface ObjectByteRange {
 }
 
 export interface ObjectReadOptions {
+  expectedSize?: number;
   range?: ObjectByteRange;
   signal?: AbortSignal;
 }
@@ -38,6 +39,7 @@ export interface ObjectWriteResult {
 }
 
 export interface ObjectRead extends ObjectWriteResult {
+  totalSize?: number;
   stream: Readable;
   size: number;
 }

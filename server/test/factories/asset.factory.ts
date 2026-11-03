@@ -64,6 +64,7 @@ export class AssetFactory {
       libraryId: null,
       livePhotoVideoId: null,
       localDateTime: new Date(now),
+      originalAuthority: 'local',
       originalFileName,
       originalPath: `/data/library/${originalFileName}`,
       ownerId: newUuid(),

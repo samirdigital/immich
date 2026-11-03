@@ -307,7 +307,7 @@ describe(AssetMediaService.name, () => {
         size: 42,
       };
 
-      mocks.asset.create.mockResolvedValue(assetEntity);
+      mocks.asset.create.mockResolvedValue({ ...assetEntity, originalAuthority: 'local' });
 
       await expect(
         sut.uploadAsset(
@@ -342,7 +342,7 @@ describe(AssetMediaService.name, () => {
         size: 42,
       };
 
-      mocks.asset.create.mockResolvedValue(assetEntity);
+      mocks.asset.create.mockResolvedValue({ ...assetEntity, originalAuthority: 'local' });
 
       await expect(sut.uploadAsset(authStub.user1, createDto, file)).resolves.toEqual({
         id: 'id_1',
@@ -468,6 +468,13 @@ describe(AssetMediaService.name, () => {
   });
 
   describe('downloadOriginal', () => {
+    beforeEach(() => {
+      Object.assign(sut, {
+        originalReader: {
+          resolve: vi.fn((_id: string, file: ImmichFileResponse) => Promise.resolve({ kind: 'local', file })),
+        },
+      });
+    });
     it('should require the asset.download permission', async () => {
       await expect(sut.downloadOriginal(authStub.admin, 'asset-1', {})).rejects.toBeInstanceOf(BadRequestException);
 
@@ -485,14 +492,15 @@ describe(AssetMediaService.name, () => {
       mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
       mocks.asset.getForOriginal.mockResolvedValue(asset);
 
-      await expect(sut.downloadOriginal(authStub.admin, asset.id, {})).resolves.toEqual(
-        new ImmichFileResponse({
+      await expect(sut.downloadOriginal(authStub.admin, asset.id, {})).resolves.toEqual({
+        kind: 'local',
+        file: new ImmichFileResponse({
           path: asset.originalPath,
           fileName: asset.originalFileName,
           contentType: 'image/jpeg',
           cacheControl: CacheControl.PrivateWithCache,
         }),
-      );
+      });
     });
 
     it('should download edited file by default when edits exist', async () => {
@@ -505,14 +513,15 @@ describe(AssetMediaService.name, () => {
       mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([editedAsset.id]));
       mocks.asset.getForOriginal.mockResolvedValue({ ...editedAsset, editedPath: editedAsset.files[3].path });
 
-      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, {})).resolves.toEqual(
-        new ImmichFileResponse({
+      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, {})).resolves.toEqual({
+        kind: 'local',
+        file: new ImmichFileResponse({
           path: editedAsset.files[3].path,
           fileName: editedAsset.originalFileName,
           contentType: 'image/jpeg',
           cacheControl: CacheControl.PrivateWithCache,
         }),
-      );
+      });
     });
 
     it('should download edited file when edited=true', async () => {
@@ -525,14 +534,15 @@ describe(AssetMediaService.name, () => {
       mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([editedAsset.id]));
       mocks.asset.getForOriginal.mockResolvedValue({ ...editedAsset, editedPath: editedAsset.files[3].path });
 
-      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, { edited: true })).resolves.toEqual(
-        new ImmichFileResponse({
+      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, { edited: true })).resolves.toEqual({
+        kind: 'local',
+        file: new ImmichFileResponse({
           path: editedAsset.files[3].path,
           fileName: editedAsset.originalFileName,
           contentType: 'image/jpeg',
           cacheControl: CacheControl.PrivateWithCache,
         }),
-      );
+      });
     });
 
     it('should not return the unedited version if requested using a shared link', async () => {
@@ -544,14 +554,15 @@ describe(AssetMediaService.name, () => {
 
       await expect(
         sut.downloadOriginal(AuthFactory.from().sharedLink().build(), editedAsset.id, { edited: false }),
-      ).resolves.toEqual(
-        new ImmichFileResponse({
+      ).resolves.toEqual({
+        kind: 'local',
+        file: new ImmichFileResponse({
           path: fullsizeEdited.path,
           fileName: editedAsset.originalFileName,
           contentType: 'image/jpeg',
           cacheControl: CacheControl.PrivateWithCache,
         }),
-      );
+      });
     });
 
     it('should download original file when edited=false', async () => {
@@ -564,14 +575,15 @@ describe(AssetMediaService.name, () => {
       mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([editedAsset.id]));
       mocks.asset.getForOriginal.mockResolvedValue(editedAsset);
 
-      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, { edited: false })).resolves.toEqual(
-        new ImmichFileResponse({
+      await expect(sut.downloadOriginal(AuthFactory.create(), editedAsset.id, { edited: false })).resolves.toEqual({
+        kind: 'local',
+        file: new ImmichFileResponse({
           path: editedAsset.originalPath,
           fileName: editedAsset.originalFileName,
           contentType: 'image/jpeg',
           cacheControl: CacheControl.PrivateWithCache,
         }),
-      );
+      });
     });
   });
 

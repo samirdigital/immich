@@ -38,6 +38,7 @@ import { FileUploadInterceptor, getFiles } from 'src/middleware/file-upload.inte
 import { LoggingRepository } from 'src/repositories/logging.repository.js';
 import { AssetMediaService } from 'src/services/asset-media.service.js';
 import { ImmichFileResponse, sendFile } from 'src/utils/file.js';
+import { sendOriginal } from 'src/utils/original-response.js';
 import { FileNotEmptyValidator, UUIDParamDto } from 'src/validation.js';
 
 @ApiTags(ApiTag.Assets)
@@ -104,7 +105,7 @@ export class AssetMediaController {
     @Res() res: Response,
     @Next() next: NextFunction,
   ) {
-    await sendFile(res, next, () => this.service.downloadOriginal(auth, id, dto), this.logger);
+    await sendOriginal(res, next, () => this.service.downloadOriginal(auth, id, dto), this.logger);
   }
 
   @Get(':id/thumbnail')

@@ -1,6 +1,7 @@
 import {
   AfterDeleteTrigger,
   AfterUpdateTrigger,
+  Check,
   Column,
   CreateDateColumn,
   DeleteDateColumn,
@@ -10,6 +11,7 @@ import {
   PrimaryGeneratedColumn,
   Table,
   type Timestamp,
+  Unique,
   UpdateDateColumn,
 } from '@immich/sql-tools';
 import { UpdateIdColumn, UpdatedAtTrigger } from 'src/decorators.js';
@@ -22,6 +24,8 @@ import { UserTable } from 'src/schema/tables/user.table.js';
 import { ASSET_CHECKSUM_CONSTRAINT } from 'src/utils/database.js';
 
 @Table('asset')
+@Unique({ columns: ['id', 'ownerId'] })
+@Check({ name: 'asset_original_authority_chk', expression: `"originalAuthority" IN ('local','object')` })
 @UpdatedAtTrigger('asset_updatedAt')
 @AfterDeleteTrigger({
   scope: 'statement',
@@ -68,6 +72,9 @@ import { ASSET_CHECKSUM_CONSTRAINT } from 'src/utils/database.js';
 })
 // For all assets, each originalpath must be unique per user and library
 export class AssetTable {
+  @Column({ default: 'local' })
+  originalAuthority!: Generated<'local' | 'object'>;
+
   @PrimaryGeneratedColumn()
   id!: Generated<string>;
 

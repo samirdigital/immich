@@ -36,11 +36,12 @@ import { AuthService } from 'src/services/auth.service.js';
 import { CliService } from 'src/services/cli.service.js';
 import { DatabaseBackupService } from 'src/services/database-backup.service.js';
 import { services } from 'src/services/index.js';
+import { originalProviders } from 'src/services/original-store.factory.js';
 import { QueueService } from 'src/services/queue.service.js';
 import { getKyselyConfig } from 'src/utils/database.js';
 import { configureUserAgent } from 'src/utils/fetch.js';
 
-const common = [...repositories, ...services, GlobalExceptionFilter];
+const common = [...repositories, ...services, ...originalProviders, GlobalExceptionFilter];
 
 const commonMiddleware = [
   { provide: APP_FILTER, useClass: GlobalExceptionFilter },
